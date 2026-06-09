@@ -1,0 +1,27 @@
+[project]
+name = "username-sandbox"
+version = "0.1.0"
+description = "Stateful mock of the 360dialog WhatsApp API simulating the username/BSUID lifecycle"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sqlalchemy[asyncio]>=2.0",
+    "aiosqlite>=0.20",
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "alembic>=1.13",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.setuptools]
+packages = ["app", "app.routers"]
