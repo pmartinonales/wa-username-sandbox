@@ -60,6 +60,36 @@ The API serves CORS for any origin, so no proxy is needed. The monitoring feed
 uses a schema-hidden `GET /sandbox/requests` endpoint, so the documented
 sandbox surface stays exactly three endpoints.
 
+## MCP server (drive the sandbox from Claude)
+
+[`mcp_server.py`](mcp_server.py) exposes the whole sandbox as MCP tools, so an
+agent can test integrations conversationally — no UI or curl needed:
+
+| Tool | What it does |
+|---|---|
+| `create_api_key` / `use_api_key` / `current_key` | Get or switch the session's key |
+| `get_config` / `update_config` | Read/patch the behavior switchboard |
+| `set_webhook_url` | Point webhooks at a real endpoint (optional) |
+| `send_business_message` | Send as the business: text / template / REQUEST_CONTACT_INFO, by phone or BSUID — error envelopes (131047, 131062, …) are returned, not raised |
+| `send_user_message` | Send as the simulated end-user, unprompted, with an inline identity patch (username / contact book / visibility) |
+| `create_template` | Auto-approved templates, incl. auth-flavored and contact-button variants |
+| `get_webhooks` | Recent webhook deliveries with one-line summaries (BSUID-only vs phone) or full payloads |
+| `get_request_log` | Recent API requests/responses with WhatsApp error codes (`errors_only` filter) |
+
+Setup:
+
+```bash
+pip install -e ".[mcp]"
+claude mcp add username-sandbox -e SANDBOX_BASE_URL=http://localhost:8000 \
+  -- $(pwd)/.venv/bin/python $(pwd)/mcp_server.py
+```
+
+(Working inside this repo, Claude Code picks it up automatically from
+[.mcp.json](.mcp.json).) Smoke-test against a running API with
+`.venv/bin/python scripts/verify_mcp.py`. Try: *"Create a sandbox key, make
+the user message me without a username, then show me why my template send
+failed."*
+
 ## The five-minute path
 
 ```bash

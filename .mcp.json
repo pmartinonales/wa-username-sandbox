@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "username-sandbox": {
+      "command": ".venv/bin/python",
+      "args": ["mcp_server.py"],
+      "env": { "SANDBOX_BASE_URL": "http://localhost:8000" }
+    }
+  }
+}
