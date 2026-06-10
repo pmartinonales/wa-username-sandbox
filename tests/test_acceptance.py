@@ -514,3 +514,62 @@ async def test_request_log(client):
     # not in the OpenAPI schema (surface audit stays at 3 sandbox endpoints)
     spec = (await client.get("/openapi.json")).json()
     assert "/sandbox/requests" not in spec["paths"]
+
+
+# user-initiated inbound emulation (POST /sandbox/inbound, schema-hidden)
+async def test_simulate_inbound_states(client):
+    env = await make_env(client)
+
+    # default config: username user, GA, no history → BSUID-only inbound
+    r = await env.call("POST", "/sandbox/inbound", {"text": "hi there"})
+    assert r["wamid"].startswith("wamid.")
+    v = await env.last_value()
+    msg, contact = v["messages"][0], v["contacts"][0]
+    assert msg["text"]["body"] == "hi there"
+    assert "from" not in msg and "wa_id" not in contact
+    assert contact["profile"]["username"]
+
+    # no username → phone present, no username field (config patch inline)
+    await env.call("POST", "/sandbox/inbound",
+                   {"text": "no handle", "config": {"user": {"has_username": False}}})
+    v = await env.last_value()
+    assert v["messages"][0]["from"] and v["contacts"][0]["wa_id"]
+    assert "username" not in v["contacts"][0]["profile"]
+
+    # username + in contact book → phone AND username present
+    await env.call("POST", "/sandbox/inbound",
+                   {"text": "known contact",
+                    "config": {"user": {"has_username": True, "in_contact_book": True}}})
+    v = await env.last_value()
+    assert v["messages"][0]["from"] and v["contacts"][0]["wa_id"]
+    assert v["contacts"][0]["profile"]["username"]
+
+    # config patches persist (same semantics as PUT /sandbox/config)
+    cfg = await env.call("GET", "/sandbox/config")
+    assert cfg["user"]["in_contact_book"] is True
+
+    # contact-card share variant
+    r = await env.call("POST", "/sandbox/inbound", {"type": "contacts", "origin": "other"})
+    v = await env.last_value()
+    assert v["messages"][0]["type"] == "contacts"
+    assert v["messages"][0]["contacts"][0]["vcard"].startswith("BEGIN:VCARD")
+
+    # invalid type rejected
+    r = await env.call("POST", "/sandbox/inbound", {"type": "video"}, expect=400)
+    assert r["error"]["code"] == 100
+
+
+async def test_simulate_inbound_opens_window(client):
+    # real window rules: closed until the user writes, open afterwards
+    env = await make_env(client)
+    from app.db import SessionLocal
+    from app.models import UserState
+    from sqlalchemy import update
+    async with SessionLocal() as session:  # undo the open-at-creation seed
+        await session.execute(update(UserState).values(window_opened_at=None))
+        await session.commit()
+    r = await env.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}},
+                       expect=400)
+    assert r["error"]["code"] == 131047
+    await env.call("POST", "/sandbox/inbound", {"text": "opening the window"})
+    await env.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})

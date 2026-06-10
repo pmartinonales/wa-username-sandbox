@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { Boxes } from "lucide-react";
 import { DEFAULT_BASE, type KeyInfo } from "@/lib/api";
 import { ConfigPanel } from "@/components/config-panel";
+import { InboundPanel } from "@/components/inbound-panel";
 import { KeyPanel } from "@/components/key-panel";
 import { Monitor } from "@/components/monitor";
 import { SendPanel } from "@/components/send-panel";
@@ -83,6 +84,7 @@ export default function Page() {
       <div className="grid gap-4 lg:grid-cols-[24rem_1fr]">
         <div className="space-y-4">
           <KeyPanel base={base} keyInfo={keyInfo} onKey={onKey} />
+          {keyInfo && <InboundPanel base={base} keyInfo={keyInfo} />}
           {keyInfo && <SendPanel base={base} keyInfo={keyInfo} />}
           {keyInfo && <ConfigPanel base={base} apiKey={keyInfo.d360_api_key} />}
         </div>

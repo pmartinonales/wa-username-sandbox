@@ -300,6 +300,7 @@ async def emit_contacts_share(session, key_id: str, origin: str) -> str:
     cfg = rules.effective_config(key)
     user = key.user
     when = rules.now()
+    user.window_opened_at = when  # a share is an inbound message: opens the 24h window
     wamid = await ids.new_wamid(session)
     shared = {"name": {"formatted_name": user.display_name,
                        "first_name": user.display_name.split(" ")[0]},

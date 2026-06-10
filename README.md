@@ -108,6 +108,15 @@ inbound reply — the exact payloads your production code must survive.
   outbound message the user can reply (`reply_to_messages`), tap a
   Share-Contact-Info button (`tap_request_contact_info`), or share their card
   manually (`share_contact_manually`).
+- **User-initiated messages:** `POST /sandbox/inbound` (D360-API-KEY auth)
+  makes the simulated user message *you*, unprompted — opening the 24h window
+  and emitting the inbound webhook with whatever identity state the config
+  describes. Optional body: `{"text": "...", "config": {<same shape as PUT
+  /sandbox/config, applied first>}}`, so "user *without* a username who *is*
+  in my contact book says hi" is one call; `{"type": "contacts", "origin":
+  "other"|"contact_request"}` triggers a contact-card share instead. (Like
+  `GET /sandbox/requests`, it's hidden from the OpenAPI schema: the documented
+  sandbox surface stays at three endpoints.)
 - **Phone change simulation:** sending to a *different* phone number after
   prior phone traffic = the user changed their phone. BSUIDs regenerate (old
   ones → `131009`) and a `system` webhook is emitted.

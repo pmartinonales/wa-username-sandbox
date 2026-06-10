@@ -127,6 +127,47 @@ async def get_webhook(ctx: Ctx = Depends(auth)):
                             "payload": r.payload} for r in rows]}
 
 
+@router.post("/sandbox/inbound", include_in_schema=False)
+async def simulate_inbound(body: dict | None = None, ctx: Ctx = Depends(auth)):
+    """Emulate the simulated user messaging YOU, unprompted — with whatever
+    identity state the config describes (username, contact book, visibility).
+
+    Body (all optional):
+      text   — message body (default "Hello!")
+      type   — "text" (default) or "contacts" (a contact-card share;
+               "origin": "other" (default, vCard) or "contact_request")
+      config — a config patch applied first, same semantics as
+               PUT /sandbox/config (persists), so state + trigger fit in
+               one call.
+
+    Hidden from OpenAPI: the documented sandbox surface stays at three
+    endpoints; this is the dashboard/testing trigger behind them.
+    """
+    from app import webhooks
+
+    body = body or {}
+    patch = body.get("config")
+    if patch:
+        rules.validate_config_patch(patch)
+        ctx.key.config = rules.deep_merge(ctx.key.config or {}, patch)
+        await ctx.session.flush()
+
+    mtype = body.get("type", "text")
+    if mtype == "text":
+        wamid = await webhooks.emit_inbound_reply(
+            ctx.session, ctx.key.id, str(body.get("text", "Hello!")))
+    elif mtype == "contacts":
+        origin = body.get("origin", "other")
+        if origin not in ("other", "contact_request"):
+            raise ApiError(100, "origin must be 'other' or 'contact_request'.")
+        wamid = await webhooks.emit_contacts_share(ctx.session, ctx.key.id, origin=origin)
+    else:
+        raise ApiError(100, f"Inbound type '{mtype}' is not supported. "
+                            "Use 'text' or 'contacts'.")
+    await ctx.session.commit()
+    return {"wamid": wamid, "window_open": True}
+
+
 @router.get("/sandbox/requests", include_in_schema=False)
 async def list_requests(limit: int = 100, ctx: Ctx = Depends(auth)):
     """Monitoring feed for the dashboard UI: this key's recent API requests.
