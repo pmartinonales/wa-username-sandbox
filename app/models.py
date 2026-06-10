@@ -109,6 +109,22 @@ class WebhookDelivery(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime)
 
 
+class RequestLog(Base):
+    """Every API request/response, for the monitoring UI. Populated by
+    middleware; exposed via the schema-hidden GET /sandbox/requests."""
+    __tablename__ = "request_logs"
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    api_key: Mapped[str | None] = mapped_column(String, nullable=True, index=True)
+    method: Mapped[str] = mapped_column(String)
+    path: Mapped[str] = mapped_column(String)
+    status_code: Mapped[int] = mapped_column(Integer)
+    error_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    request_body: Mapped[str | None] = mapped_column(String, nullable=True)
+    response_body: Mapped[str | None] = mapped_column(String, nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime)
+
+
 class UsernameChange(Base):
     __tablename__ = "username_changes"
     id: Mapped[str] = mapped_column(String, primary_key=True)

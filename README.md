@@ -39,6 +39,27 @@ python3 -m venv .venv && .venv/bin/pip install -e ".[test]"
 - Webhook payload reference: **http://localhost:8000/docs/webhooks** (also [WEBHOOKS.md](WEBHOOKS.md))
 - Tests: `.venv/bin/pytest`
 
+## Dashboard UI
+
+A Next.js + shadcn/ui dashboard lives in [`ui/`](ui/): create API keys, flip
+every behavior switch/selector, send test messages, and watch a live feed of
+API requests (with bodies and error codes) and webhook deliveries. No UI auth —
+access is scoped by whichever `D360-API-KEY` you create or paste (stored in
+localStorage).
+
+```bash
+cd ui && npm install && npm run dev    # http://localhost:3000
+```
+
+Point it at the API with the "API base URL" field in the header (default
+`http://localhost:8000`, override at build time with `NEXT_PUBLIC_API_BASE`).
+
+**Deploy on Vercel:** import the repo, set the project **Root Directory** to
+`ui`, and add an env var `NEXT_PUBLIC_API_BASE=https://<your-hosted-sandbox>`.
+The API serves CORS for any origin, so no proxy is needed. The monitoring feed
+uses a schema-hidden `GET /sandbox/requests` endpoint, so the documented
+sandbox surface stays exactly three endpoints.
+
 ## The five-minute path
 
 ```bash

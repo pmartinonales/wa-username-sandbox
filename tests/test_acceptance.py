@@ -493,3 +493,24 @@ async def test_config_validation(client):
     assert cfg["user"]["phone_visibility"] == "never"
     assert cfg["user"]["has_username"] is True  # untouched default
     assert cfg["statuses"]["delays_ms"] == [0, 0, 0]  # earlier FAST patch kept
+
+
+# request log feed for the monitoring UI (hidden from OpenAPI)
+async def test_request_log(client):
+    env = await make_env(client)
+    await env.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    await env.send({"recipient": "garbage", "type": "text", "text": {"body": "x"}},
+                   expect=400)
+    r = await env.call("GET", "/sandbox/requests")
+    rows = r["data"]
+    paths = [(x["method"], x["path"], x["status_code"]) for x in rows]
+    assert ("POST", "/messages", 200) in paths
+    assert ("POST", "/messages", 400) in paths
+    failed = [x for x in rows if x["status_code"] == 400][0]
+    assert failed["error_code"] == 131009
+    assert "garbage" in failed["request_body"]
+    # the key-creation request itself is attributed to the new key
+    assert any(x["path"] == "/sandbox/keys" for x in rows)
+    # not in the OpenAPI schema (surface audit stays at 3 sandbox endpoints)
+    spec = (await client.get("/openapi.json")).json()
+    assert "/sandbox/requests" not in spec["paths"]

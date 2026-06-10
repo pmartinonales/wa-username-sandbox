@@ -2,10 +2,12 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 from app.db import Base, engine
 from app.errors import ApiError
+from app.reqlog import RequestLogMiddleware
 from app.routers import mock, sandbox
 
 DESCRIPTION = """
@@ -48,6 +50,11 @@ app = FastAPI(
 )
 app.include_router(sandbox.router)
 app.include_router(mock.router)
+
+# the dashboard UI (and partner tooling) may run on any origin; no cookies/auth
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
+                   allow_headers=["*"])
+app.add_middleware(RequestLogMiddleware)
 
 
 @app.exception_handler(ApiError)

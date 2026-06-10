@@ -9,7 +9,7 @@ from app import ids, rules, settings
 from app.db import get_session
 from app.deps import Ctx, auth
 from app.errors import ApiError
-from app.models import ApiKey, Bsuid, UserState, WebhookDelivery
+from app.models import ApiKey, Bsuid, RequestLog, UserState, WebhookDelivery
 
 router = APIRouter(tags=["Sandbox"])
 
@@ -125,6 +125,21 @@ async def get_webhook(ctx: Ctx = Depends(auth)):
                             "attempts": r.attempts, "response_code": r.response_code,
                             "created_at": r.created_at.isoformat(),
                             "payload": r.payload} for r in rows]}
+
+
+@router.get("/sandbox/requests", include_in_schema=False)
+async def list_requests(limit: int = 100, ctx: Ctx = Depends(auth)):
+    """Monitoring feed for the dashboard UI: this key's recent API requests.
+    Hidden from OpenAPI — the documented sandbox surface stays three endpoints."""
+    limit = max(1, min(limit, 500))
+    rows = (await ctx.session.execute(
+        select(RequestLog).where(RequestLog.api_key == ctx.key.d360_api_key)
+        .order_by(RequestLog.id.desc()).limit(limit))).scalars().all()
+    return {"data": [{"id": r.id, "method": r.method, "path": r.path,
+                      "status_code": r.status_code, "error_code": r.error_code,
+                      "request_body": r.request_body, "response_body": r.response_body,
+                      "duration_ms": r.duration_ms,
+                      "created_at": r.created_at.isoformat()} for r in rows]}
 
 
 @router.put(
