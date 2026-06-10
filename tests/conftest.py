@@ -7,6 +7,7 @@ os.environ["DEFAULT_STATUS_DELAYS_MS"] = "0,0,0"
 os.environ["WEBHOOK_MAX_ATTEMPTS"] = "1"
 os.environ["WEBHOOK_BACKOFF_BASE_S"] = "0"
 os.environ["ID_SEED"] = "test-seed"
+os.environ["KEYS_PER_IP_PER_HOUR"] = "10000"
 
 import httpx  # noqa: E402
 import pytest  # noqa: E402
@@ -34,95 +35,82 @@ async def client():
 
 
 async def drain():
-    """Wait for all scheduled webhook tasks (statuses, deliveries) to finish."""
+    """Wait for all scheduled webhook tasks (statuses, consumer actions)."""
     await webhooks.wait_for_pending()
 
 
+# zero-delay everything: tests assert on the delivery log, not wall-clock
+FAST = {"statuses": {"delays_ms": [0, 0, 0]},
+        "consumer_actions": {"reply_delay_ms": 0, "tap_delay_ms": 0}}
+
+
 class Env:
-    """One tenant + portfolio + business number, with all keys handy."""
+    """One sandbox key with helpers around the three sandbox endpoints."""
 
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
-        self.sandbox_key: str = ""
-        self.tenant_id: str = ""
-        self.portfolio_id: str = ""
-        self.number_id: str = ""
         self.api_key: str = ""
+        self.display_phone_number: str = ""
+        self.waba_id: str = ""
 
     @property
-    def sb(self) -> dict:
-        return {"SANDBOX-API-KEY": self.sandbox_key}
-
-    @property
-    def mk(self) -> dict:
+    def hk(self) -> dict:
         return {"D360-API-KEY": self.api_key}
 
-    async def sandbox(self, method: str, path: str, json: dict | None = None,
-                      expect: int = 200, **kw):
-        r = await self.client.request(method, path, json=json, headers=self.sb, **kw)
-        assert r.status_code == expect, f"{method} {path}: {r.status_code} {r.text}"
-        return r.json()
-
-    async def mock(self, method: str, path: str, json: dict | None = None,
+    async def call(self, method: str, path: str, json: dict | None = None,
                    expect: int = 200, key: str | None = None, **kw):
         headers = {"D360-API-KEY": key or self.api_key}
         r = await self.client.request(method, path, json=json, headers=headers, **kw)
         assert r.status_code == expect, f"{method} {path}: {r.status_code} {r.text}"
         return r.json()
 
-    async def deliveries(self, field: str | None = None, number_id: str | None = None):
+    async def config(self, patch: dict, expect: int = 200) -> dict:
+        return await self.call("PUT", "/sandbox/config", patch, expect=expect)
+
+    async def deliveries(self, field: str | None = None) -> list[dict]:
         await drain()
-        params = {"page_size": 200}
+        rows = (await self.call("GET", "/sandbox/webhook"))["deliveries"]
+        rows.reverse()  # oldest first
         if field:
-            params["field"] = field
-        if number_id:
-            params["business_number_id"] = number_id
-        r = await self.client.get("/sandbox/webhook_deliveries", params=params, headers=self.sb)
-        return r.json()["data"]
+            rows = [r for r in rows if r["field"] == field]
+        return rows
 
-    async def last_value(self, field: str = "messages", number_id: str | None = None) -> dict:
-        rows = await self.deliveries(field=field, number_id=number_id)
-        assert rows, f"no '{field}' webhook deliveries"
-        return rows[-1]["payload"]["entry"][0]["changes"][0]["value"]
-
-    async def values(self, field: str = "messages", number_id: str | None = None) -> list[dict]:
-        rows = await self.deliveries(field=field, number_id=number_id)
+    async def values(self, field: str = "messages") -> list[dict]:
+        rows = await self.deliveries(field=field)
         return [r["payload"]["entry"][0]["changes"][0]["value"] for r in rows]
 
-    async def advance(self, hours: float):
-        await self.sandbox("POST", "/sandbox/time/advance", {"hours": hours})
+    async def last_value(self, field: str = "messages") -> dict:
+        vals = await self.values(field=field)
+        assert vals, f"no '{field}' webhook deliveries"
+        return vals[-1]
 
-    async def create_consumer(self, phone="5511988880001", name="Test Consumer",
-                              country="BR", username=None) -> dict:
-        body = {"phone": phone, "display_name": name, "country": country}
-        if username:
-            body["username"] = username
-        return await self.sandbox("POST", "/sandbox/consumers", body)
-
-    async def inbound(self, consumer_id: str, text="hi", number_id: str | None = None):
-        return await self.sandbox("POST", f"/sandbox/consumers/{consumer_id}/send_message",
-                                  {"to_business_number_id": number_id or self.number_id,
-                                   "text": text})
+    async def send(self, body: dict, expect: int = 200) -> dict:
+        return await self.call("POST", "/messages", body, expect=expect)
 
 
-async def make_env(client: httpx.AsyncClient, *, ga_mode: bool = False,
-                   behavior: dict | None = None) -> Env:
+async def make_env(client: httpx.AsyncClient, *, config: dict | None = None,
+                   fast: bool = True, name: str = "test") -> Env:
     env = Env(client)
-    r = await client.post("/sandbox/tenants", json={"name": "t", "ga_mode": ga_mode})
+    r = await client.post("/sandbox/keys", json={"name": name})
     assert r.status_code == 200, r.text
     data = r.json()
-    env.tenant_id, env.sandbox_key = data["id"], data["sandbox_api_key"]
-    pf = await env.sandbox("POST", "/sandbox/portfolios", {"name": "pf"})
-    env.portfolio_id = pf["id"]
-    bn = await env.sandbox("POST", "/sandbox/numbers",
-                           {"portfolio_id": env.portfolio_id, "behavior": behavior or {}})
-    env.number_id, env.api_key = bn["id"], bn["d360_api_key"]
+    env.api_key = data["d360_api_key"]
+    env.display_phone_number = data["display_phone_number"]
+    env.waba_id = data["waba_id"]
+    patch = {}
+    if fast:
+        patch = FAST
+    if config:
+        from app.rules import deep_merge
+        patch = deep_merge(patch, config)
+    if patch:
+        await env.config(patch)
     return env
 
 
-def statuses_of(values: list[dict]) -> list[dict]:
-    out = []
-    for v in values:
-        for s in v.get("statuses", []):
-            out.append((v, s))
-    return out
+def statuses_of(values: list[dict]) -> list[tuple[dict, dict]]:
+    return [(v, s) for v in values for s in v.get("statuses", [])]
+
+
+def inbound_of(values: list[dict]) -> list[dict]:
+    return [v for v in values if "messages" in v and "statuses" not in v]

@@ -6,7 +6,8 @@ services:
     environment:
       DATABASE_URL: "sqlite+aiosqlite:////data/sandbox.db"
       ID_SEED: "username-sandbox-seed"
-      # MASTER_KEY: "set-me-to-protect-tenant-creation"
+      # KEY_TTL_DAYS: "90"
+      # KEYS_PER_IP_PER_HOUR: "30"
     volumes:
       - sandbox-data:/data
     healthcheck:

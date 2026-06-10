@@ -1,13 +1,12 @@
-"""Webhook payload builders (§9) and the async delivery engine (§9.1).
+"""Webhook payload builders (v1 §9) and the async delivery engine, plus the
+simulated-consumer actions (§3.3 consumer_actions) that replace v1's
+Simulation API: auto-replies, auto-taps on REQUEST_CONTACT_INFO, manual shares.
 
-Every webhook is recorded in WebhookDelivery (the Simulation API exposes the
-log), and additionally POSTed to the business number's webhook_url when one is
-set, with up to WEBHOOK_MAX_ATTEMPTS retries and exponential backoff.
-
-Delayed status webhooks are scheduled as asyncio tasks; visibility is
-re-evaluated at delivery time so config flips and contact shares affect the
-very next status. Pending delayed webhooks do not survive a restart
-(documented simplification).
+Every webhook is recorded in WebhookDelivery (GET /sandbox/webhook exposes the
+last 50) and POSTed to the configured URL with retries + HMAC signature.
+Identifier inclusion follows the v1 §9.4 matrix exactly; visibility is
+re-evaluated at delivery time, so config flips affect the very next webhook.
+Pending delayed webhooks do not survive a restart (documented simplification).
 """
 import asyncio
 import hashlib
@@ -16,13 +15,10 @@ import json
 
 import httpx
 
-from app import ids, settings
+from app import ids, rules, settings
 from app.db import SessionLocal
 from app.errors import TITLES
-from app.models import (
-    BusinessNumber, Consumer, Message, Portfolio, Tenant, WebhookDelivery,
-)
-from app import rules
+from app.models import ApiKey, Message, WebhookDelivery
 
 PENDING: set[asyncio.Task] = set()
 
@@ -33,26 +29,36 @@ async def wait_for_pending() -> None:
         await asyncio.gather(*list(PENDING), return_exceptions=True)
 
 
-def envelope(waba_id: str, field: str, value: dict) -> dict:
+def _spawn(coro) -> None:
+    task = asyncio.create_task(coro)
+    PENDING.add(task)
+    task.add_done_callback(PENDING.discard)
+
+
+def envelope(key: ApiKey, field: str, value: dict) -> dict:
     return {"object": "whatsapp_business_account",
-            "entry": [{"id": waba_id, "changes": [{"value": value, "field": field}]}]}
+            "entry": [{"id": key.waba_id, "changes": [{"value": value, "field": field}]}]}
 
 
-def metadata(bn: BusinessNumber) -> dict:
-    return {"display_phone_number": bn.display_phone_number, "phone_number_id": bn.id}
+def metadata(key: ApiKey) -> dict:
+    return {"display_phone_number": key.display_phone_number,
+            "phone_number_id": key.phone_number_id}
 
 
-def build_contact(consumer: Consumer, bsuid: str, *, visible: bool,
-                  parent_user_id: str | None, include_username: bool = True) -> dict:
-    profile = {"name": consumer.display_name}
-    if consumer.username and include_username:
-        profile["username"] = consumer.username  # no '@' prefix
+def build_contact(key: ApiKey, cfg: dict, *, visible: bool,
+                  include_username: bool = True) -> dict:
+    user = key.user
+    profile = {"name": user.display_name}
+    username = rules.user_username(key, cfg)
+    if username and include_username:
+        profile["username"] = username  # no '@' prefix
     contact = {"profile": profile}
     if visible:
-        contact["wa_id"] = consumer.phone
-    contact["user_id"] = bsuid
-    if parent_user_id:
-        contact["parent_user_id"] = parent_user_id
+        contact["wa_id"] = user.phone
+    contact["user_id"] = user.bsuid
+    parent = rules.parent_id(key, cfg)
+    if parent:
+        contact["parent_user_id"] = parent
     return contact
 
 
@@ -63,22 +69,15 @@ def conversation_block(wamid: str, category: str) -> dict:
 
 # ----------------------------------------------------------------- dispatch
 
-async def record_and_send(session, bn: BusinessNumber, tenant_id: str, field: str,
-                          payload: dict) -> None:
-    """Create the delivery-log row inside the caller's session, then deliver."""
-    row = WebhookDelivery(id=await ids.new_id(session, "wd"), tenant_id=tenant_id,
-                          business_number_id=bn.id, endpoint=bn.webhook_url, field=field,
-                          payload=payload, created_at=rules.now_for(await session.get(Tenant, tenant_id)),
-                          status="pending")
+async def record_and_send(session, key: ApiKey, field: str, value: dict) -> None:
+    """Create the delivery-log row in the caller's session, then deliver async."""
+    payload = envelope(key, field, value)
+    row = WebhookDelivery(id=await ids.new_id(session, "wd"), api_key_id=key.id,
+                          endpoint=key.webhook_url, field=field, payload=payload,
+                          created_at=rules.now(), status="pending")
     session.add(row)
     await session.flush()
-    _spawn(_deliver(row.id, bn.webhook_url, bn.webhook_secret, payload))
-
-
-def _spawn(coro) -> None:
-    task = asyncio.create_task(coro)
-    PENDING.add(task)
-    task.add_done_callback(PENDING.discard)
+    _spawn(_deliver(row.id, key.webhook_url, key.webhook_secret, payload))
 
 
 async def _get_row(session, row_id: str) -> WebhookDelivery | None:
@@ -129,19 +128,18 @@ async def _deliver(row_id: str, url: str | None, secret: str | None, payload: di
         await session.commit()
 
 
-# ----------------------------------------------------- status webhooks (§9.2)
+# ------------------------------------------------ status webhooks (v1 §9.2)
 
-def schedule_status_webhooks(message_id: str, cfg: dict) -> None:
-    sequence = cfg["status_sequence"]
-    delays = cfg["status_delays_ms"]
-    # one task per message: statuses are emitted strictly in order (delays are
-    # measured from send time, so we sleep the increments between them)
-    _spawn(_emit_sequence(message_id, list(sequence), list(delays),
-                          int(cfg["failed_error_code"])))
+def schedule_message_lifecycle(message_id: str, cfg: dict) -> None:
+    """One task per message: emit the configured status sequence in order, then
+    trigger any configured consumer actions after 'delivered'."""
+    _spawn(_lifecycle(message_id, list(cfg["statuses"]["sequence"]),
+                      list(cfg["statuses"]["delays_ms"]),
+                      int(cfg["statuses"]["failed_error_code"])))
 
 
-async def _emit_sequence(message_id: str, sequence: list[str], delays: list[int],
-                         failed_code: int) -> None:
+async def _lifecycle(message_id: str, sequence: list[str], delays: list[int],
+                     failed_code: int) -> None:
     elapsed_ms = 0
     for i, status in enumerate(sequence):
         delay_ms = delays[i] if i < len(delays) else (delays[-1] if delays else 0)
@@ -151,108 +149,196 @@ async def _emit_sequence(message_id: str, sequence: list[str], delays: list[int]
         async with SessionLocal() as session:
             await emit_status(session, message_id, status, failed_code)
             await session.commit()
+        if status == "delivered":
+            _spawn(_consumer_actions(message_id))
 
 
-async def emit_status(session, message_id: str, status: str, failed_code: int = 131049,
-                      errors: list | None = None) -> None:
-    """Build + dispatch one status webhook; state (visibility, contact book) is
-    evaluated now, not at send time."""
+async def emit_status(session, message_id: str, status: str,
+                      failed_code: int = 131049, errors: list | None = None) -> None:
+    """Build + dispatch one status webhook; visibility and contact-book state
+    are evaluated now, not at send time."""
     msg = await session.get(Message, message_id)
-    bn = await session.get(BusinessNumber, msg.business_number_id)
-    portfolio = await session.get(Portfolio, bn.portfolio_id)
-    tenant = await session.get(Tenant, portfolio.tenant_id)
-    consumer = await session.get(Consumer, msg.consumer_id)
-    cfg = rules.effective_config(bn, tenant)
+    key = await session.get(ApiKey, msg.api_key_id)
+    cfg = rules.effective_config(key)
+    user = key.user
 
-    # §6: a BSUID send that gets delivered writes contact book + cache —
-    # flagged phone_known=False so it never reveals the phone (§12.1).
-    if status == "delivered" and msg.addressed_by == "bsuid":
-        await rules.touch_contact(session, portfolio, bn, consumer,
-                                  rules.now_for(tenant), phone_known=False)
-    if status == "delivered" and msg.addressed_by == "phone":
-        await rules.touch_contact(session, portfolio, bn, consumer, rules.now_for(tenant))
+    # v1 §6: a delivered BSUID send writes contact book + cache, but flagged
+    # phone_known=False so it never reveals the phone; delivered phone sends
+    # refresh with phone_known=True.
+    if status == "delivered":
+        rules.touch_contact(user, rules.now(), phone_known=(msg.addressed_by == "phone"))
 
-    bsuid = await rules.get_or_create_bsuid(session, consumer, portfolio)
-    parent = await rules.parent_id_for(session, consumer, portfolio, cfg, tenant)
-    ts = str(int(rules.now_for(tenant).timestamp()))
+    parent = rules.parent_id(key, cfg)
+    ts = str(int(rules.now().timestamp()))
     category = msg.payload.get("_category", "service")
 
     status_obj = {"id": msg.wamid, "status": status, "timestamp": ts}
     if status == "failed":
-        # §9.2/§9.4: no contacts array; phone-addressed → no recipient_user_id
+        # v1 §9.2: no contacts array; phone-addressed → no recipient_user_id
         if msg.addressed_by == "phone":
-            status_obj["recipient_id"] = consumer.phone
+            status_obj["recipient_id"] = user.phone
         else:
-            status_obj["recipient_user_id"] = bsuid
+            status_obj["recipient_user_id"] = user.bsuid
             if parent:
                 status_obj["recipient_parent_user_id"] = parent
         code = errors[0]["code"] if errors else failed_code
         status_obj["errors"] = errors or [{
             "code": code, "title": TITLES.get(code, "Message failed"),
             "error_data": {"details": "Sandbox-simulated delivery failure."}}]
-        value = {"messaging_product": "whatsapp", "metadata": metadata(bn),
+        value = {"messaging_product": "whatsapp", "metadata": metadata(key),
                  "statuses": [status_obj]}
     else:
-        visible = (msg.addressed_by == "phone") or await rules.phone_visible(
-            session, bn, consumer, portfolio, tenant, cfg)
+        # the matrix's "addressed by phone → phone always shown" applies under
+        # auto rules; a forced phone_visibility override wins (spec v2 §6.15)
+        vis_cfg = cfg["user"]["phone_visibility"]
+        if vis_cfg in ("always", "never"):
+            visible = vis_cfg == "always"
+        else:
+            visible = (msg.addressed_by == "phone") or rules.phone_visible(key, cfg)
         if visible:
-            status_obj["recipient_id"] = consumer.phone
-        status_obj["recipient_user_id"] = bsuid
+            status_obj["recipient_id"] = user.phone
+        status_obj["recipient_user_id"] = user.bsuid
         if parent:
             status_obj["recipient_parent_user_id"] = parent
         status_obj["conversation"] = conversation_block(msg.wamid, category)
         status_obj["pricing"] = {"billable": True, "pricing_model": "PMP",
                                  "category": category, "type": "regular"}
-        # §9.4: username on delivered/read only, never on sent
-        include_username = status in ("delivered", "read")
-        contact = build_contact(consumer, bsuid, visible=visible, parent_user_id=parent,
-                                include_username=include_username)
-        value = {"messaging_product": "whatsapp", "metadata": metadata(bn),
+        # v1 §9.4: username on delivered/read only, never on sent
+        contact = build_contact(key, cfg, visible=visible,
+                                include_username=status in ("delivered", "read"))
+        value = {"messaging_product": "whatsapp", "metadata": metadata(key),
                  "contacts": [contact], "statuses": [status_obj]}
 
     msg.statuses = [*(msg.statuses or []), {"status": status, "timestamp": ts}]
-    await record_and_send(session, bn, tenant.id, "messages", envelope(portfolio.id, "messages", value))
+    await record_and_send(session, key, "messages", value)
 
 
-# ---------------------------------------------------- inbound webhooks (§9.3)
+# ------------------------------------- simulated consumer actions (§3.3)
 
-async def emit_inbound_message(session, bn: BusinessNumber, consumer: Consumer,
-                               wamid: str, messages_value: dict) -> None:
-    portfolio = await session.get(Portfolio, bn.portfolio_id)
-    tenant = await session.get(Tenant, portfolio.tenant_id)
-    cfg = rules.effective_config(bn, tenant)
-    visible = await rules.phone_visible(session, bn, consumer, portfolio, tenant, cfg)
-    bsuid = await rules.get_or_create_bsuid(session, consumer, portfolio)
-    parent = await rules.parent_id_for(session, consumer, portfolio, cfg, tenant)
-    msg = {**messages_value, "id": wamid,
-           "timestamp": str(int(rules.now_for(tenant).timestamp()))}
-    if visible:
-        msg["from"] = consumer.phone
-    msg["from_user_id"] = bsuid
-    value = {"messaging_product": "whatsapp", "metadata": metadata(bn),
-             "contacts": [build_contact(consumer, bsuid, visible=visible, parent_user_id=parent)],
-             "messages": [msg]}
-    await record_and_send(session, bn, tenant.id, "messages", envelope(portfolio.id, "messages", value))
+def is_request_contact_info(session_templates: list, msg: Message) -> bool:
+    if msg.type == "interactive":
+        return (msg.payload.get("interactive") or {}).get("type") == "request_contact_info"
+    if msg.type == "template":
+        for t in session_templates:
+            if t.name == (msg.payload.get("template") or {}).get("name"):
+                return any(str(b.get("type", "")).upper() == "REQUEST_CONTACT_INFO"
+                           for comp in (t.components or [])
+                           if str(comp.get("type", "")).upper() == "BUTTONS"
+                           for b in comp.get("buttons", []))
+    return False
 
 
-async def emit_system_phone_change(session, bn: BusinessNumber, consumer: Consumer,
-                                   old_bsuid: str, new_bsuid: str) -> None:
-    portfolio = await session.get(Portfolio, bn.portfolio_id)
-    tenant = await session.get(Tenant, portfolio.tenant_id)
+async def _consumer_actions(message_id: str) -> None:
+    """After a delivered outbound message, the simulated user acts per config."""
+    from sqlalchemy import select
+
+    from app.models import Template
+
+    async with SessionLocal() as session:
+        msg = await session.get(Message, message_id)
+        key = await session.get(ApiKey, msg.api_key_id)
+        cfg = rules.effective_config(key)
+        actions = cfg["consumer_actions"]
+        templates = (await session.execute(select(Template).where(
+            Template.api_key_id == key.id))).scalars().all()
+        rci = is_request_contact_info(templates, msg)
+
+    # each action delays independently from the 'delivered' moment
+    if rci and actions["tap_request_contact_info"]:
+        _spawn(_delayed_share(msg.api_key_id, "contact_request",
+                              actions["tap_delay_ms"]))
+    if actions["reply_to_messages"]:
+        _spawn(_delayed_reply(msg.api_key_id, actions["reply_text"],
+                              actions["reply_delay_ms"]))
+    if actions["share_contact_manually"]:
+        _spawn(_delayed_share(msg.api_key_id, "other", actions["tap_delay_ms"]))
+
+
+async def _delayed_share(key_id: str, origin: str, delay_ms: int) -> None:
+    await asyncio.sleep(delay_ms / 1000.0)
+    async with SessionLocal() as session:
+        await emit_contacts_share(session, key_id, origin=origin)
+        await session.commit()
+
+
+async def _delayed_reply(key_id: str, text: str, delay_ms: int) -> None:
+    await asyncio.sleep(delay_ms / 1000.0)
+    async with SessionLocal() as session:
+        await emit_inbound_reply(session, key_id, text)
+        await session.commit()
+
+
+async def emit_inbound_reply(session, key_id: str, text: str) -> str:
+    """The simulated user sends a message: inbound webhook (v1 §9.3), opens the
+    24h window, writes contact book + cache when the phone is visible (v1 §6)."""
+    key = await session.get(ApiKey, key_id)
+    cfg = rules.effective_config(key)
+    user = key.user
+    when = rules.now()
     wamid = await ids.new_wamid(session)
-    value = {"messaging_product": "whatsapp", "metadata": metadata(bn),
-             "messages": [{"id": wamid, "timestamp": str(int(rules.now_for(tenant).timestamp())),
+    session.add(Message(id=await ids.new_id(session, "msg"), wamid=wamid,
+                        direction="inbound", api_key_id=key.id, addressed_by="phone",
+                        type="text", payload={"text": {"body": text}},
+                        statuses=[], created_at=when))
+    user.window_opened_at = when
+    visible = rules.phone_visible(key, cfg)
+    if visible:
+        rules.touch_contact(user, when, phone_known=True)
+    msg = {"type": "text", "text": {"body": text}, "id": wamid,
+           "timestamp": str(int(when.timestamp()))}
+    if visible:
+        msg["from"] = user.phone
+    msg["from_user_id"] = user.bsuid
+    value = {"messaging_product": "whatsapp", "metadata": metadata(key),
+             "contacts": [build_contact(key, cfg, visible=visible)],
+             "messages": [msg]}
+    await record_and_send(session, key, "messages", value)
+    return wamid
+
+
+async def emit_contacts_share(session, key_id: str, origin: str) -> str:
+    """v1 §9.5 contacts webhook; vCard only when origin='other'; a
+    contact_request share writes contact book + cache (phone visible after)."""
+    key = await session.get(ApiKey, key_id)
+    cfg = rules.effective_config(key)
+    user = key.user
+    when = rules.now()
+    wamid = await ids.new_wamid(session)
+    shared = {"name": {"formatted_name": user.display_name,
+                       "first_name": user.display_name.split(" ")[0]},
+              "phones": [{"phone": f"+{user.phone}", "wa_id": user.phone,
+                          "type": "MOBILE"}],
+              "origin": origin}
+    if origin == "other":
+        shared["vcard"] = (f"BEGIN:VCARD\nVERSION:3.0\nFN:{user.display_name}\n"
+                           f"TEL;TYPE=CELL:+{user.phone}\nEND:VCARD")
+    visible = rules.phone_visible(key, cfg)
+    msg = {"id": wamid, "timestamp": str(int(when.timestamp())), "type": "contacts",
+           "from_user_id": user.bsuid, "contacts": [shared]}
+    if visible:
+        msg["from"] = user.phone
+    value = {"messaging_product": "whatsapp", "metadata": metadata(key),
+             "contacts": [build_contact(key, cfg, visible=visible)],
+             "messages": [msg]}
+    await record_and_send(session, key, "messages", value)
+    if origin == "contact_request":
+        rules.touch_contact(user, when, phone_known=True)
+    return wamid
+
+
+async def emit_system_phone_change(session, key: ApiKey, old_bsuid: str,
+                                   new_bsuid: str) -> None:
+    wamid = await ids.new_wamid(session)
+    value = {"messaging_product": "whatsapp", "metadata": metadata(key),
+             "messages": [{"id": wamid, "timestamp": str(int(rules.now().timestamp())),
                            "type": "system",
                            "system": {"body": "User changed phone number",
                                       "user_id": old_bsuid, "new_user_id": new_bsuid}}]}
-    await record_and_send(session, bn, tenant.id, "messages", envelope(portfolio.id, "messages", value))
+    await record_and_send(session, key, "messages", value)
 
 
-async def emit_business_username_update(session, bn: BusinessNumber, status: str) -> None:
-    portfolio = await session.get(Portfolio, bn.portfolio_id)
-    tenant = await session.get(Tenant, portfolio.tenant_id)
-    value = {"display_phone_number": bn.display_phone_number, "status": status}
+async def emit_business_username_update(session, key: ApiKey, status: str) -> None:
+    value = {"display_phone_number": key.display_phone_number, "status": status}
     if status != "deleted":
-        value["username"] = bn.username
-    await record_and_send(session, bn, tenant.id, "business_username_update",
-                          envelope(portfolio.id, "business_username_update", value))
+        value["username"] = key.username
+    await record_and_send(session, key, "business_username_update", value)

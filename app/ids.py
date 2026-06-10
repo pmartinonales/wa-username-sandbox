@@ -1,9 +1,6 @@
-"""Deterministic, seedable ID generation.
-
-Every generated identifier is a pure function of (ID_SEED, a persistent
-per-prefix counter or stable entity ids), so a sandbox seeded the same way
-always produces the same BSUIDs, wamids and API keys.
-"""
+"""Deterministic, seedable ID generation: every identifier is a pure function
+of (ID_SEED, persistent counters or stable entity ids), so a sandbox seeded the
+same way always produces the same keys, BSUIDs and wamids."""
 import hashlib
 
 from sqlalchemy import select
@@ -47,20 +44,43 @@ async def new_wamid(session: AsyncSession) -> str:
     return "wamid.HBg" + _h("wamid", str(n))[:40].upper() + "="
 
 
-def make_bsuid(country: str, consumer_id: str, portfolio_id: str) -> str:
-    return f"{country.upper()}.{digits(19, 'bsuid', consumer_id, portfolio_id)}"
+def make_api_key(n: int) -> str:
+    return "sk_sandbox_" + _h("key", str(n))[:32]
 
 
-def make_parent_bsuid(country: str, consumer_id: str, account_id: str) -> str:
-    return f"{country.upper()}.ENT.{digits(15, 'pbsuid', consumer_id, account_id)}"
+COUNTRY_PREFIX = {"BR": "5511", "US": "1212", "DE": "4930", "IN": "9111", "GB": "4420"}
 
 
-def make_api_key(kind: str, n: int) -> str:
-    return _h("key", kind, str(n))[:40]
+def business_phone(country: str, n: int) -> str:
+    return COUNTRY_PREFIX.get(country.upper(), "5511") + "90" + f"{n:07d}"
 
 
-def make_phone(consumer_id: str) -> str:
-    return "55" + digits(11, "phone", consumer_id)
+def waba_id(n: int) -> str:
+    return "1" + f"{n:014d}"
+
+
+def phone_number_id(n: int) -> str:
+    return "2" + f"{n:014d}"
+
+
+def portfolio_id(n: int) -> str:
+    return "3" + f"{n:014d}"
+
+
+def user_phone(country: str, key_id: str) -> str:
+    return COUNTRY_PREFIX.get(country.upper(), "5511") + "8" + digits(8, "userphone", key_id)
+
+
+def make_bsuid(country: str, key_id: str, phone: str) -> str:
+    return f"{country.upper()}.{digits(19, 'bsuid', key_id, phone)}"
+
+
+def make_parent_bsuid(country: str, key_id: str) -> str:
+    return f"{country.upper()}.ENT.{digits(15, 'pbsuid', key_id)}"
+
+
+def derived_username(key_id: str) -> str:
+    return f"user.{digits(8, 'uname', key_id)}"
 
 
 def fbtrace_id(*parts: str) -> str:

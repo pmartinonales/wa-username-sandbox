@@ -1,424 +1,479 @@
-"""Acceptance scenarios §12 — each test number matches the spec scenario."""
-from tests.conftest import drain, make_env
+"""Acceptance scenarios (spec v2 §6 = v1 §12 re-expressed against the v2
+surface: no Simulation API — config + consumer_actions only)."""
+import asyncio
+import socket
+from datetime import timedelta
+
+from sqlalchemy import update
+
+from tests.conftest import drain, inbound_of, make_env, statuses_of
+
+BSUID = "BR.13491208655302741918"
+RCI_INTERACTIVE = {"type": "interactive",
+                   "interactive": {"type": "request_contact_info",
+                                   "body": {"text": "Share?"},
+                                   "action": {"name": "request_contact_info"}}}
 
 
-async def test_01_golden_path(client):
-    env = await make_env(client, ga_mode=True)
-    c = await env.create_consumer(username="alice.golden", name="Alice Golden")
-
-    # consumer (username, GA, no history) sends inbound
-    await env.inbound(c["id"], "hello business")
-    value = await env.last_value()
-    contact, msg = value["contacts"][0], value["messages"][0]
-    assert contact["user_id"].startswith("BR.")
-    assert contact["profile"]["username"] == "alice.golden"
-    assert "wa_id" not in contact and "from" not in msg
-    assert msg["from_user_id"] == contact["user_id"]
-    bsuid = contact["user_id"]
-
-    # partner replies via recipient=<BSUID>
-    resp = await env.mock("POST", "/messages",
-                          {"recipient": bsuid, "type": "text", "text": {"body": "hi!"}})
-    assert resp["contacts"] == [{"input": bsuid, "user_id": bsuid}]
-    wamid = resp["messages"][0]["id"]
+# 1 ─ golden path
+async def test_golden_path(client):
+    env = await make_env(client, config={
+        "user": {"has_username": True},
+        "consumer_actions": {"reply_to_messages": True}})
+    r = await env.send({"recipient": BSUID, "type": "text", "text": {"body": "hi"}})
+    assert r["contacts"][0] == {"input": BSUID, "user_id": BSUID}
+    wamid = r["messages"][0]["id"]
     assert wamid.startswith("wamid.")
 
-    # sent/delivered/read statuses: recipient_user_id, no recipient_id
-    await drain()
-    seen = []
-    for v in await env.values():
-        for s in v.get("statuses", []):
-            if s["id"] == wamid:
-                seen.append(s["status"])
-                assert s["recipient_user_id"] == bsuid
-                assert "recipient_id" not in s
-    assert seen == ["sent", "delivered", "read"]
-
-    # partner sends REQUEST_CONTACT_INFO interactive
-    rci = await env.mock("POST", "/messages", {
-        "recipient": bsuid, "type": "interactive",
-        "interactive": {"type": "request_contact_info", "body": {"text": "share?"},
-                        "action": {"name": "request_contact_info"}}})
-    rci_wamid = rci["messages"][0]["id"]
-    await drain()
-
-    # consumer taps → contacts webhook, origin=contact_request, no vCard
-    await env.sandbox("POST", f"/sandbox/consumers/{c['id']}/tap_share_contact",
-                      {"message_wamid": rci_wamid})
-    value = await env.last_value()
-    m = value["messages"][0]
-    assert m["type"] == "contacts"
-    assert m["from_user_id"] == bsuid
-    shared = m["contacts"][0]
-    assert shared["origin"] == "contact_request"
-    assert "vcard" not in shared
-    assert shared["phones"][0]["phone"] == "+" + c["phone"]
-    assert shared["phones"][0]["wa_id"] == c["phone"]
-
-    # subsequent webhooks include the phone again
-    await env.inbound(c["id"], "thanks")
-    value = await env.last_value()
-    assert value["contacts"][0]["wa_id"] == c["phone"]
-    assert value["messages"][0]["from"] == c["phone"]
-
-
-async def test_02_bsuid_send_closed_window(client):
-    env = await make_env(client, ga_mode=True)
-    c = await env.create_consumer(username="bob.window")
-    await env.inbound(c["id"])
-    state = await env.sandbox("GET", f"/sandbox/state/consumers/{c['id']}")
-    bsuid = state["bsuids"][0]["bsuid"]
-    await env.advance(25)  # window expired
-    r = await client.post("/messages", headers=env.mk,
-                          json={"recipient": bsuid, "type": "text", "text": {"body": "x"}})
-    assert r.status_code == 400
-    err = r.json()["error"]
-    assert err["code"] == 131047
-    assert "24-hour" in err["error_data"]["details"]
-    # consumer re-opens window → succeeds
-    await env.inbound(c["id"])
-    await env.mock("POST", "/messages",
-                   {"recipient": bsuid, "type": "text", "text": {"body": "x"}})
-
-
-async def test_03_auth_template_to_bsuid(client):
-    env = await make_env(client, ga_mode=True)
-    await env.mock("POST", "/v1/configs/templates",
-                   {"name": "otp", "language": "en", "category": "utility",
-                    "auth_flavor": "one-tap", "components": []})
-    c = await env.create_consumer(username="auth.target")
-    await env.inbound(c["id"])
-    state = await env.sandbox("GET", f"/sandbox/state/consumers/{c['id']}")
-    bsuid = state["bsuids"][0]["bsuid"]
-    r = await client.post("/messages", headers=env.mk,
-                          json={"recipient": bsuid, "type": "template",
-                                "template": {"name": "otp", "language": {"code": "en"}}})
-    assert r.status_code == 400
-    assert r.json()["error"]["code"] == 131062
-    # same template to phone → succeeds
-    resp = await env.mock("POST", "/messages",
-                          {"to": c["phone"], "type": "template",
-                           "template": {"name": "otp", "language": {"code": "en"}}})
-    assert resp["contacts"][0]["wa_id"] == c["phone"]
-
-
-async def test_04_bsuid_cross_portfolio(client):
-    env = await make_env(client, ga_mode=True)
-    c = await env.create_consumer(username="cross.portfolio")
-    await env.inbound(c["id"])
-    state = await env.sandbox("GET", f"/sandbox/state/consumers/{c['id']}")
-    bsuid_a = state["bsuids"][0]["bsuid"]
-    # second portfolio + number in the same tenant
-    pf_b = await env.sandbox("POST", "/sandbox/portfolios", {"name": "B"})
-    bn_b = await env.sandbox("POST", "/sandbox/numbers", {"portfolio_id": pf_b["id"]})
-    r = await client.post("/messages", headers={"D360-API-KEY": bn_b["d360_api_key"]},
-                          json={"recipient": bsuid_a, "type": "text", "text": {"body": "x"}})
-    assert r.status_code == 400
-    err = r.json()["error"]
-    assert err["code"] == 131009
-    assert "portfolio" in err["error_data"]["details"]
-
-
-async def test_05_to_wins_over_recipient(client):
-    env = await make_env(client, ga_mode=True)
-    c = await env.create_consumer(username="both.fields")
-    await env.inbound(c["id"])
-    state = await env.sandbox("GET", f"/sandbox/state/consumers/{c['id']}")
-    bsuid = state["bsuids"][0]["bsuid"]
-    resp = await env.mock("POST", "/messages",
-                          {"to": c["phone"], "recipient": bsuid,
-                           "type": "text", "text": {"body": "x"}})
-    contact = resp["contacts"][0]
-    assert contact["wa_id"] == c["phone"]
-    assert "user_id" not in contact
-
-
-async def test_06_pre_ga_phone_always_visible(client):
-    env = await make_env(client, ga_mode=False)
-    c = await env.create_consumer(username="prega.user")
-    await env.inbound(c["id"])
-    value = await env.last_value()
-    assert value["contacts"][0]["wa_id"] == c["phone"]
-    assert value["messages"][0]["from"] == c["phone"]
-    assert value["contacts"][0]["profile"]["username"] == "prega.user"
-    # statuses on a BSUID send also include the phone pre-GA
-    bsuid = value["contacts"][0]["user_id"]
-    await env.mock("POST", "/messages", {"recipient": bsuid, "type": "text",
-                                         "text": {"body": "x"}})
-    await drain()
-    last = (await env.values())[-1]
-    assert last["statuses"][0]["recipient_id"] == c["phone"]
-
-
-async def test_07_contact_book_delete(client):
-    env = await make_env(client, ga_mode=True)
-    c = await env.create_consumer(username="deleted.book")
-    # pre-GA-style history: flip GA off, interact (writes book+cache), back on
-    await env.sandbox("PATCH", "/sandbox/tenants/me", {"ga_mode": False})
-    await env.inbound(c["id"])
-    await env.sandbox("PATCH", "/sandbox/tenants/me", {"ga_mode": True})
-    state = await env.sandbox("GET", f"/sandbox/state/consumers/{c['id']}")
-    bsuid = state["bsuids"][0]["bsuid"]
-    assert state["contact_book"], "expected a contact book entry"
-
-    resp = await env.mock("DELETE", f"/contact_book?messaging_product=whatsapp&bsuid={bsuid}")
-    assert resp == {"messaging_product": "whatsapp", "success": True, "deleted": True}
-
-    # inbound webhooks STILL arrive, BSUID-only (alpha webhook-drop regression)
-    before = len(await env.values())
-    await env.inbound(c["id"], "still here")
     values = await env.values()
-    assert len(values) == before + 1
-    contact, msg = values[-1]["contacts"][0], values[-1]["messages"][0]
-    assert "wa_id" not in contact and "from" not in msg
-    assert msg["from_user_id"] == bsuid
+    pairs = [s for v, s in statuses_of(values) if s["id"] == wamid]
+    assert [s["status"] for s in pairs] == ["sent", "delivered", "read"]
+    for s in pairs:
+        assert s["recipient_user_id"] == BSUID
+        assert "recipient_id" not in s
+    inbound = inbound_of(values)
+    assert inbound, "no auto-reply received"
+    msg, contact = inbound[-1]["messages"][0], inbound[-1]["contacts"][0]
+    assert "from" not in msg and "wa_id" not in contact
+    assert msg["from_user_id"] == BSUID
+    assert contact["profile"]["username"]
 
-    # second delete: success, deleted=false
-    resp = await env.mock("DELETE", f"/contact_book?messaging_product=whatsapp&bsuid={bsuid}")
-    assert resp["deleted"] is False
-
-    # parent BSUIDs and foreign BSUIDs are rejected with success:false, 400
-    r = await client.request("DELETE", "/contact_book",
-                             params={"messaging_product": "whatsapp", "bsuid": "BR.ENT.123456"},
-                             headers=env.mk)
-    assert r.status_code == 400 and r.json()["success"] is False
-
-
-async def test_08_thirty_day_cache_per_number(client):
-    env = await make_env(client, ga_mode=False)
-    c = await env.create_consumer(username="cache.user")
-    # second number in the SAME portfolio
-    bn_b = await env.sandbox("POST", "/sandbox/numbers", {"portfolio_id": env.portfolio_id})
-    # pre-GA: inbound to number A writes contact book + cache(A)
-    await env.inbound(c["id"])
-    await env.sandbox("PATCH", "/sandbox/tenants/me", {"ga_mode": True})
-    # surgically remove the contact book entry, leaving the cache intact
-    await env.sandbox("DELETE",
-                      f"/sandbox/state/consumers/{c['id']}/contact_book/{env.portfolio_id}")
-
-    state = await env.sandbox("GET", f"/sandbox/state/consumers/{c['id']}")
-    bsuid = state["bsuids"][0]["bsuid"]
-
-    # A still sees the phone via its 30-day cache
-    await env.mock("POST", "/messages", {"recipient": bsuid, "type": "text",
-                                         "text": {"body": "from A"}})
+    # REQUEST_CONTACT_INFO → tap → contacts webhook → phone visible again
+    await env.send({"recipient": BSUID, **RCI_INTERACTIVE})
     await drain()
-    last_a = (await env.values(number_id=env.number_id))[-1]
-    assert last_a["statuses"][0].get("recipient_id") == c["phone"]
+    shares = [v for v in await env.values()
+              if "messages" in v and v["messages"][0]["type"] == "contacts"]
+    assert shares
+    share = shares[-1]["messages"][0]["contacts"][0]
+    assert share["origin"] == "contact_request"
+    assert "vcard" not in share
+    assert share["phones"][0]["wa_id"]
 
-    # B (same portfolio, no cache) does not — open B's window first
-    await env.inbound(c["id"], number_id=bn_b["id"])
-    await env.mock("POST", "/messages", {"recipient": bsuid, "type": "text",
-                                         "text": {"body": "from B"}}, key=bn_b["d360_api_key"])
-    await drain()
-    vals_b = [v for v in await env.values(number_id=bn_b["id"]) if v.get("statuses")]
-    assert vals_b and all("recipient_id" not in v["statuses"][0] for v in vals_b)
-
-    # advance 31 days → A loses it too
-    await env.advance(31 * 24)
-    await env.inbound(c["id"])  # reopen window (does not write cache: phone hidden now?)
-    state = await env.sandbox("GET", f"/sandbox/state/consumers/{c['id']}")
-    assert all(e["expired"] for e in state["cache"]
-               if e["business_number_id"] == env.number_id)
-    await env.mock("POST", "/messages", {"recipient": bsuid, "type": "text",
-                                         "text": {"body": "late"}})
-    await drain()
-    last_a = (await env.values(number_id=env.number_id))[-1]
-    assert "recipient_id" not in last_a["statuses"][0]
+    r = await env.send({"recipient": BSUID, "type": "text", "text": {"body": "ty"}})
+    last = [s for v, s in statuses_of(await env.values())
+            if s["id"] == r["messages"][0]["id"]]
+    assert all(s.get("recipient_id") for s in last), "phone did not come back"
 
 
-async def test_09_username_rate_limit_and_validation(client):
-    env = await make_env(client, ga_mode=False)
-    for i, name in enumerate(["shop.one", "shop.two", "shop.three"]):
-        resp = await env.mock("POST", "/username", {"username": name})
-        assert resp == {"status": "reserved"}
-    r = await client.post("/username", headers=env.mk, json={"username": "shop.four"})
-    assert r.status_code == 429
-    err = r.json()["error"]
-    assert err["code"] == 131056
-    assert "max 3 changes per 14 days" in err["error_data"]["details"]
-    assert "Next change available at" in err["error_data"]["details"]
-    assert "claimed" not in err["error_data"]["details"].lower()
-
-    # after 14 days the window rolls over
-    await env.advance(14 * 24 + 1)
-    resp = await env.mock("POST", "/username", {"username": "shop.four"})
-    assert resp["status"] == "reserved"
-
-    # duplicate name (another number) → 147001
-    pf2 = await env.sandbox("POST", "/sandbox/portfolios", {"name": "p2"})
-    bn2 = await env.sandbox("POST", "/sandbox/numbers", {"portfolio_id": pf2["id"]})
-    r = await client.post("/username", headers={"D360-API-KEY": bn2["d360_api_key"]},
-                          json={"username": "SHOP.FOUR"})  # case-insensitive
-    assert r.status_code == 400 and r.json()["error"]["code"] == 147001
-
-    # bad formats → 100
-    for bad in ["ab", "a" * 36, ".lead", "trail.", "dou..ble", "wwwshop", "shop.com",
-                "12345", "bad name", "shop.html"]:
-        r = await client.post("/username", headers={"D360-API-KEY": bn2["d360_api_key"]},
-                              json={"username": bad})
-        assert r.status_code == 400 and r.json()["error"]["code"] == 100, bad
-    # '.'/'_' significant: shop_four is a different name and is free
-    resp = await env.mock("POST", "/username", {"username": "shop_four"},
-                          key=bn2["d360_api_key"])
-    assert resp["status"] == "reserved"
+# 2 ─ closed window → 131047; open → succeeds
+async def test_closed_window(client):
+    env = await make_env(client, config={"user": {"service_window": "closed"}})
+    r = await env.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}},
+                       expect=400)
+    assert r["error"]["code"] == 131047
+    assert "24-hour" in r["error"]["error_data"]["details"]
+    await env.config({"user": {"service_window": "open"}})
+    await env.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
 
 
-async def test_10_template_button_validation_and_interactive_typo(client):
+# 3 ─ auth template to BSUID → 131062; to phone → ok
+async def test_auth_template_to_bsuid(client):
     env = await make_env(client)
-    r = await client.post("/v1/configs/templates", headers=env.mk, json={
+    await env.call("POST", "/v1/configs/templates", {
+        "name": "otp", "language": "en", "category": "utility",
+        "auth_flavor": "one-tap", "components": []})
+    body = {"type": "template", "template": {"name": "otp", "language": {"code": "en"}}}
+    r = await env.send({"recipient": BSUID, **body}, expect=400)
+    assert r["error"]["code"] == 131062
+    r = await env.send({"to": "5511988880001", **body})
+    assert r["messages"][0]["id"]
+
+
+# 4 ─ BSUID from key A used with key B → 131009
+async def test_foreign_bsuid(client):
+    env_a = await make_env(client)
+    env_b = await make_env(client)
+    r = await env_a.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    bsuid_a = r["contacts"][0]["user_id"]
+    r = await env_b.send({"recipient": bsuid_a, "type": "text", "text": {"body": "x"}},
+                         expect=400)
+    assert r["error"]["code"] == 131009
+    assert "portfolio" in r["error"]["error_data"]["details"]
+
+
+async def test_malformed_bsuid(client):
+    env = await make_env(client)
+    for bad in ("13491208655302741918", "BR-13491208655302741918", "BR.12345",
+                "br.13491208655302741918", "BR.abc91208655302741918"):
+        r = await env.send({"recipient": bad, "type": "text", "text": {"body": "x"}},
+                           expect=400)
+        assert r["error"]["code"] == 131009, bad
+
+
+# 5 ─ to + recipient both present → phone wins
+async def test_phone_precedence(client):
+    env = await make_env(client)
+    r = await env.send({"to": "5511988880001", "recipient": BSUID,
+                        "type": "text", "text": {"body": "x"}})
+    c = r["contacts"][0]
+    assert c["wa_id"] == "5511988880001"
+    assert "user_id" not in c
+    assert r["messages"][0]["id"].startswith("wamid.")
+
+
+# 6 ─ ga_mode=false: phone everywhere despite username
+async def test_pre_ga(client):
+    env = await make_env(client, config={
+        "ga_mode": False, "user": {"has_username": True},
+        "consumer_actions": {"reply_to_messages": True}})
+    await env.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    values = await env.values()
+    for v, s in statuses_of(values):
+        assert s.get("recipient_id"), s
+        assert v["contacts"][0].get("wa_id")
+    inbound = inbound_of(values)
+    assert inbound and inbound[-1]["messages"][0].get("from")
+
+
+# 7 ─ contact book delete → BSUID-only; inbound still arrives
+async def test_contact_book_delete(client):
+    env = await make_env(client, config={
+        "consumer_actions": {"reply_to_messages": True}})
+    # phone send writes the contact book → phone visible
+    await env.send({"to": "5511988880001", "type": "text", "text": {"body": "x"}})
+    values = await env.values()
+    bsuid = statuses_of(values)[-1][1]["recipient_user_id"]
+    assert statuses_of(values)[-1][1].get("recipient_id")
+
+    r = await env.call("DELETE", f"/contact_book?messaging_product=whatsapp&bsuid={bsuid}")
+    assert r == {"messaging_product": "whatsapp", "success": True, "deleted": True}
+    r = await env.call("DELETE", f"/contact_book?messaging_product=whatsapp&bsuid={bsuid}")
+    assert r["success"] is True and r["deleted"] is False
+
+    before = len(await env.values())
+    await env.send({"recipient": bsuid, "type": "text", "text": {"body": "still?"}})
+    values = (await env.values())[before:]
+    for v, s in statuses_of(values):
+        assert "recipient_id" not in s, s
+    inbound = inbound_of(values)
+    assert inbound, "inbound dropped after contact book delete (alpha bug regression)"
+    assert "from" not in inbound[-1]["messages"][0]
+
+    # rejections: parent BSUID and foreign BSUID → success:false, 400
+    r = await env.call("DELETE", "/contact_book?messaging_product=whatsapp&bsuid=BR.ENT.123456",
+                       expect=400)
+    assert r["success"] is False
+    other = await make_env(client)
+    await other.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    r = await env.call("DELETE", f"/contact_book?messaging_product=whatsapp&bsuid={BSUID}",
+                       expect=400)
+    assert r["success"] is False
+
+
+# 8 ─ cache vs contact book: forced in_contact_book=false, cache still works
+async def test_cache_independent_of_contact_book(client):
+    env = await make_env(client, config={"user": {"in_contact_book": False}})
+    await env.send({"to": "5511988880001", "type": "text", "text": {"body": "x"}})
+    s = statuses_of(await env.values())[-1][1]
+    assert s.get("recipient_id"), "30-day cache should keep the phone visible"
+    # a fresh key with no phone history has no cache → not visible
+    env2 = await make_env(client, config={"user": {"in_contact_book": False,
+                                                   "service_window": "open"}})
+    await env2.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    s = statuses_of(await env2.values())[-1][1]
+    assert "recipient_id" not in s
+
+
+# 9 ─ username: rate limit, duplicate, bad format, lifecycle
+async def test_username_rules(client):
+    env = await make_env(client, name="acme")
+    sugg = await env.call("GET", "/username_suggestions")
+    assert len(sugg["data"][0]["username_suggestions"]) == 3
+
+    for i in range(3):
+        r = await env.call("POST", "/username", {"username": f"acme.try{i}"})
+        assert r["status"] == "approved"  # ga_mode defaults to true
+    r = await env.call("POST", "/username", {"username": "acme.try9"}, expect=429)
+    assert r["error"]["code"] == 131056
+    assert "Next change available at" in r["error"]["error_data"]["details"]
+    assert "claimed" not in r["error"]["error_data"]["details"].lower()
+
+    env2 = await make_env(client)
+    r = await env2.call("POST", "/username", {"username": "ACME.TRY2"}, expect=400)
+    assert r["error"]["code"] == 147001  # case-insensitive duplicate
+
+    for bad in ("ab", "a" * 36, "no letter!", "12345678", ".lead", "trail.",
+                "dou..ble", "wwwshop", "acme.com", "acme.html"):
+        r = await env2.call("POST", "/username", {"username": bad}, expect=400)
+        assert r["error"]["code"] == 100, bad
+
+    r = await env.call("GET", "/username")
+    assert r == {"username": "acme.try2", "status": "active"}  # active under GA
+    assert await env.call("DELETE", "/username") == {"success": True}
+    assert await env.call("GET", "/username") == {}
+    assert await env.call("DELETE", "/username") == {"success": False}
+    ups = await env.values(field="business_username_update")
+    assert [u["status"] for u in ups] == ["approved", "approved", "approved", "deleted"]
+    assert "username" not in ups[-1]
+    assert ups[0]["username"] == "acme.try0"
+
+    env3 = await make_env(client, config={"ga_mode": False})
+    r = await env3.call("POST", "/username", {"username": "preg.a.name"})
+    assert r["status"] == "reserved"
+    assert (await env3.call("GET", "/username"))["status"] == "reserved"
+
+
+# 10 ─ template button validation + interactive typo
+async def test_template_validation(client):
+    env = await make_env(client)
+    r = await env.call("POST", "/v1/configs/templates", {
         "name": "t1", "language": "en", "category": "utility",
         "components": [{"type": "BUTTONS", "buttons": [
-            {"type": "REQUEST_CONTACT_INFO", "text": "Gimme your contact"}]}]})
-    assert r.status_code == 400
-    err = r.json()["error"]
-    assert err["error_subcode"] == 2388153
-    assert err["error_user_title"] == "Button text modification not allowed"
-
-    r = await client.post("/v1/configs/templates", headers=env.mk, json={
+            {"type": "REQUEST_CONTACT_INFO", "text": "Share My Info"}]}]}, expect=400)
+    assert r["error"]["error_subcode"] == 2388153
+    assert r["error"]["error_user_title"] == "Button text modification not allowed"
+    r = await env.call("POST", "/v1/configs/templates", {
         "name": "t2", "language": "en", "category": "utility",
-        "components": [{"type": "BUTTONS", "buttons": [{"type": "REQUEST_CONTACT_INFO"}]}]})
-    assert r.status_code == 400
-    assert r.json()["error"]["error_subcode"] == 2388050
-
-    c = await env.create_consumer()
-    await env.inbound(c["id"])
-    r = await client.post("/messages", headers=env.mk, json={
-        "to": c["phone"], "type": "interactive",
-        "interactive": {"type": "contact_request", "body": {"text": "x"},
-                        "action": {"name": "request_contact_info"}}})
-    assert r.status_code == 400
-    details = r.json()["error"]["error_data"]["details"]
-    assert "'contact_request' is not a valid interactive type" in details
-    assert "request_contact_info" in details
+        "components": [{"type": "BUTTONS", "buttons": [
+            {"type": "REQUEST_CONTACT_INFO"}]}]}, expect=400)
+    assert r["error"]["error_subcode"] == 2388050
+    r = await env.send({"recipient": BSUID, "type": "interactive",
+                        "interactive": {"type": "contact_request"}}, expect=400)
+    assert "request_contact_info" in r["error"]["error_data"]["details"]
 
 
-async def test_11_phone_change_regenerates_bsuid(client):
-    env = await make_env(client, ga_mode=True)
-    c = await env.create_consumer(username="phone.changer")
-    await env.inbound(c["id"])
-    state = await env.sandbox("GET", f"/sandbox/state/consumers/{c['id']}")
-    old_bsuid = state["bsuids"][0]["bsuid"]
-
-    resp = await env.sandbox("POST", f"/sandbox/consumers/{c['id']}/change_phone",
-                             {"phone": "5511977770000"})
-    new_bsuid = resp["bsuids"][0]["new"]
-    assert new_bsuid != old_bsuid
-
-    # system webhook with old/new user_id
-    value = await env.last_value()
-    msg = value["messages"][0]
-    assert msg["type"] == "system"
-    assert msg["system"]["body"] == "User changed phone number"
-    assert msg["system"]["user_id"] == old_bsuid
-    assert msg["system"]["new_user_id"] == new_bsuid
-
-    # old BSUID → 131009... (it no longer exists; sandbox auto-creates a NEW
-    # consumer for well-formed unknown BSUIDs, so use a malformed one to assert
-    # the error path, and assert the old BSUID no longer maps to this consumer)
-    state = await env.sandbox("GET", f"/sandbox/state/consumers/{c['id']}")
-    assert all(m["bsuid"] != old_bsuid for m in state["bsuids"])
-    r = await client.post("/messages", headers=env.mk,
-                          json={"recipient": "BR.123", "type": "text", "text": {"body": "x"}})
-    assert r.status_code == 400 and r.json()["error"]["code"] == 131009
-
-
-async def test_12_failed_status_shape(client):
-    env = await make_env(client, behavior={"status_sequence": ["sent", "failed"],
-                                           "failed_error_code": 131026})
-    c = await env.create_consumer()
-    await env.inbound(c["id"])
-    await env.mock("POST", "/messages", {"to": c["phone"], "type": "text",
-                                         "text": {"body": "x"}})
+# 11 ─ phone change regenerates BSUID + system webhook; old BSUID → 131009
+async def test_phone_change(client):
+    env = await make_env(client)
+    await env.send({"to": "5511911110001", "type": "text", "text": {"body": "x"}})
+    old_bsuid = statuses_of(await env.values())[-1][1]["recipient_user_id"]
+    await env.send({"to": "5511922220002", "type": "text", "text": {"body": "x"}})
     await drain()
-    failed = [v for v in await env.values()
-              for s in v.get("statuses", []) if s["status"] == "failed"]
-    assert failed, "expected a failed status webhook"
+    systems = [v for v in await env.values()
+               if "messages" in v and v["messages"][0]["type"] == "system"]
+    assert systems, "no system webhook on phone change"
+    sysmsg = systems[-1]["messages"][0]["system"]
+    assert sysmsg["body"] == "User changed phone number"
+    assert sysmsg["user_id"] == old_bsuid
+    new_bsuid = sysmsg["new_user_id"]
+    assert new_bsuid != old_bsuid
+    r = await env.send({"recipient": old_bsuid, "type": "text", "text": {"body": "x"}},
+                       expect=400)
+    assert r["error"]["code"] == 131009
+    await env.send({"recipient": new_bsuid, "type": "text", "text": {"body": "x"}})
+
+
+# 12 ─ failed status: no contacts; phone-addressed → no recipient_user_id
+async def test_failed_status_shape(client):
+    env = await make_env(client, config={
+        "statuses": {"sequence": ["sent", "failed"], "delays_ms": [0, 0]}})
+    await env.send({"to": "5511988880001", "type": "text", "text": {"body": "x"}})
+    failed = [v for v, s in statuses_of(await env.values()) if s["status"] == "failed"]
+    assert failed
     v = failed[-1]
     assert "contacts" not in v
     s = v["statuses"][0]
-    assert "recipient_user_id" not in s  # phone-addressed
-    assert s["recipient_id"] == c["phone"]
+    assert s["recipient_id"] and "recipient_user_id" not in s
+    assert s["errors"][0]["code"] == 131049
+
+    env2 = await make_env(client, config={
+        "statuses": {"sequence": ["sent", "failed"], "delays_ms": [0, 0],
+                     "failed_error_code": 131026}})
+    await env2.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    v = [v for v, s in statuses_of(await env2.values()) if s["status"] == "failed"][-1]
+    s = v["statuses"][0]
+    assert "contacts" not in v
+    assert s["recipient_user_id"] and "recipient_id" not in s
     assert s["errors"][0]["code"] == 131026
 
 
-async def test_13_tenant_isolation(client):
-    env_a = await make_env(client, ga_mode=True)
-    env_b = await make_env(client, ga_mode=True)
-    cb = await env_b.create_consumer(phone="5511966660000", username="tenant.b.user")
-    await env_b.inbound(cb["id"])
-    state_b = await env_b.sandbox("GET", f"/sandbox/state/consumers/{cb['id']}")
-    bsuid_b = state_b["bsuids"][0]["bsuid"]
-
-    # A cannot read B's consumer via the Simulation API
-    r = await client.get(f"/sandbox/state/consumers/{cb['id']}", headers=env_a.sb)
-    assert r.status_code == 404
-
-    # Using B's BSUID with A's key never reaches B's consumer: the sandbox
-    # auto-creates a fresh consumer inside tenant A instead.
-    before_b = len(await env_b.values())
-    await env_a.mock("POST", "/messages", {"recipient": bsuid_b, "type": "template",
-                                           "template": {"name": "x"}}, expect=404)
-    # (template doesn't exist in A; use behavior override to send free-form)
-    await env_a.sandbox("PUT", f"/sandbox/numbers/{env_a.number_id}/behavior",
-                        {"service_window": "open"})
-    await env_a.mock("POST", "/messages", {"recipient": bsuid_b, "type": "text",
-                                           "text": {"body": "hi"}})
-    await drain()
-    assert len(await env_b.values()) == before_b  # B saw nothing
-    deliveries_a = await env_a.values()
-    assert deliveries_a  # A's webhooks went to A
+# 13 ─ key isolation
+async def test_key_isolation(client):
+    env_a = await make_env(client)
+    env_b = await make_env(client)
+    await env_a.send({"to": "5511988880001", "type": "text", "text": {"body": "x"}})
+    assert await env_b.values() == []
+    assert (await env_a.values()) != []
+    r = await client.post("/messages", json={"to": "1", "type": "text",
+                                             "text": {"body": "x"}},
+                          headers={"D360-API-KEY": "sk_sandbox_nope"})
+    assert r.status_code == 401
 
 
-async def test_14_config_first_flow(client):
-    env = await make_env(client, behavior={
-        "end_user_has_username": True, "phone_visibility": "never",
-        "ga_mode": True, "service_window": "open"})
-    arbitrary = "BR.1234567890123456789"
-    resp = await env.mock("POST", "/messages", {"recipient": arbitrary, "type": "text",
-                                                "text": {"body": "config-first"}})
-    assert resp["contacts"][0] == {"input": arbitrary, "user_id": arbitrary}
-    await drain()
-    vals = [v for v in await env.values() if v.get("statuses")]
-    assert len(vals) == 3
-    for v in vals:
-        s = v["statuses"][0]
-        assert s["recipient_user_id"] == arbitrary and "recipient_id" not in s
-    # username present on delivered/read contacts, never sent
-    by_status = {v["statuses"][0]["status"]: v for v in vals}
-    assert "username" not in by_status["sent"]["contacts"][0]["profile"]
-    assert by_status["delivered"]["contacts"][0]["profile"]["username"]
-    assert by_status["read"]["contacts"][0]["profile"]["username"]
+# 14 ─ config-first flow, visibility flip, error injection
+async def test_config_first(client):
+    env = await make_env(client, config={
+        "ga_mode": True, "user": {"has_username": True, "phone_visibility": "never"}})
+    r = await env.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    assert r["contacts"][0]["user_id"] == BSUID
+    values = await env.values()
+    for v, s in statuses_of(values):
+        assert "recipient_id" not in s
+        if s["status"] in ("delivered", "read"):
+            assert v["contacts"][0]["profile"]["username"]
+        if s["status"] == "sent":
+            assert "username" not in v["contacts"][0]["profile"]
 
-    # flip phone_visibility → next statuses include the phone
-    await env.mock("PUT", "/configs/behavior", {"phone_visibility": "always"})
-    await env.mock("POST", "/messages", {"recipient": arbitrary, "type": "text",
-                                         "text": {"body": "now visible"}})
-    await drain()
-    last = [v for v in await env.values() if v.get("statuses")][-1]
-    assert last["statuses"][0]["recipient_id"]
+    await env.config({"user": {"phone_visibility": "always"}})
+    before = len(await env.values())
+    await env.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    for v, s in statuses_of((await env.values())[before:]):
+        assert s.get("recipient_id"), "phone_visibility=always not honored"
 
-    # inject_error: next send fails with 131047, the one after succeeds
-    await env.mock("PUT", "/configs/behavior",
-                   {"inject_error": {"on": "messages", "code": 131047, "times": 1}})
-    r = await client.post("/messages", headers=env.mk,
-                          json={"recipient": arbitrary, "type": "text", "text": {"body": "x"}})
-    assert r.status_code == 400 and r.json()["error"]["code"] == 131047
-    await env.mock("POST", "/messages", {"recipient": arbitrary, "type": "text",
-                                         "text": {"body": "ok again"}})
+    await env.config({"inject_error": {"on": "messages", "code": 131047, "times": 1}})
+    r = await env.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}},
+                       expect=400)
+    assert r["error"]["code"] == 131047
+    await env.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    assert (await env.call("GET", "/sandbox/config"))["inject_error"] is None
 
 
-async def test_15_service_window_overrides(client):
-    env = await make_env(client, behavior={"service_window": "closed"})
-    c = await env.create_consumer()
-    await env.inbound(c["id"])  # real window open, but config says closed
-    r = await client.post("/messages", headers=env.mk,
-                          json={"to": c["phone"], "type": "text", "text": {"body": "x"}})
-    assert r.status_code == 400 and r.json()["error"]["code"] == 131047
+# 15 ─ the five-minute path, with a real HTTP webhook receiver
+async def test_five_minute_path(client):
+    import json as _json
 
-    await env.sandbox("PUT", f"/sandbox/numbers/{env.number_id}/behavior",
-                      {"service_window": "open"})
-    c2 = await env.create_consumer(phone="5511955550000")
-    # no prior inbound, still passes
-    await env.mock("POST", "/messages", {"to": c2["phone"], "type": "text",
-                                         "text": {"body": "x"}})
+    import uvicorn
+
+    received: list[dict] = []
+
+    async def receiver(scope, receive, send):
+        body = b""
+        while True:
+            ev = await receive()
+            body += ev.get("body", b"")
+            if not ev.get("more_body"):
+                break
+        received.append(_json.loads(body))
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(receiver, log_level="error", lifespan="off"))
+    task = asyncio.create_task(server.serve(sockets=[sock]))
+    try:
+        for _ in range(100):
+            if server.started:
+                break
+            await asyncio.sleep(0.05)
+        assert server.started
+
+        # 1. POST /sandbox/keys
+        r = await client.post("/sandbox/keys", json={"name": "fivemin"})
+        key = r.json()["d360_api_key"]
+        hk = {"D360-API-KEY": key}
+        # 2. PUT /sandbox/webhook
+        r = await client.put("/sandbox/webhook", headers=hk,
+                             json={"url": f"http://127.0.0.1:{port}/wh"})
+        assert r.status_code == 200
+        # 3. PUT /sandbox/config
+        r = await client.put("/sandbox/config", headers=hk, json={
+            "user": {"has_username": True, "phone_visibility": "never"},
+            "consumer_actions": {"reply_to_messages": True, "reply_delay_ms": 0},
+            "statuses": {"delays_ms": [0, 0, 0]}})
+        assert r.status_code == 200
+        # 4. POST /messages — the only other endpoints used are real API
+        r = await client.post("/messages", headers=hk, json={
+            "to": "5511988880001", "type": "text", "text": {"body": "Hi!"}})
+        assert r.status_code == 200, r.text
+        wamid = r.json()["messages"][0]["id"]
+        assert r.json()["contacts"][0]["wa_id"] == "5511988880001"
+
+        await drain()
+        values = [p["entry"][0]["changes"][0]["value"] for p in received]
+        sts = [s for v in values for s in v.get("statuses", [])]
+        assert {s["status"] for s in sts} == {"sent", "delivered", "read"}
+        for s in sts:
+            assert s["id"] == wamid
+            assert s["recipient_user_id"] and "recipient_id" not in s
+        inbound = [v for v in values if "messages" in v and "statuses" not in v]
+        assert inbound, "no inbound reply delivered to the webhook endpoint"
+        msg = inbound[-1]["messages"][0]
+        assert msg["from_user_id"] and "from" not in msg
+    finally:
+        server.should_exit = True
+        await task
+
+
+# 16 ─ surface audit: exactly three non-Meta endpoints
+async def test_surface_audit(client):
+    r = await client.get("/openapi.json")
+    paths = set(r.json()["paths"])
+    sandbox_paths = {p for p in paths if p.startswith("/sandbox")}
+    assert sandbox_paths == {"/sandbox/keys", "/sandbox/webhook", "/sandbox/config"}
+    assert paths - sandbox_paths == {
+        "/messages", "/marketing_messages", "/username", "/username_suggestions",
+        "/contact_book", "/parent-bsuid-accounts", "/v1/configs/templates"}
+
+
+async def test_marketing_messages(client):
+    env = await make_env(client)
+    await env.call("POST", "/v1/configs/templates",
+                   {"name": "promo", "language": "en", "category": "marketing",
+                    "components": []})
+    await env.call("POST", "/v1/configs/templates",
+                   {"name": "util", "language": "en", "category": "utility",
+                    "components": []})
+    r = await env.call("POST", "/marketing_messages",
+                       {"to": "5511988880001", "type": "template",
+                        "template": {"name": "promo", "language": {"code": "en"}}})
+    assert r["messages"][0]["message_status"] == "accepted"
+    r = await env.call("POST", "/marketing_messages",
+                       {"to": "5511988880001", "type": "template",
+                        "template": {"name": "util", "language": {"code": "en"}}},
+                       expect=400)
+    assert r["error"]["code"] == 100
+    r = await env.call("POST", "/marketing_messages",
+                       {"to": "5511988880001", "type": "text", "text": {"body": "x"}},
+                       expect=400)
+    assert r["error"]["code"] == 100
+
+
+async def test_parent_bsuid(client):
+    env = await make_env(client, config={"user": {"parent_bsuid": True}})
+    acct = await env.call("GET", "/parent-bsuid-accounts")
+    assert acct["parent_bsuid_account_id"]
+    assert len(acct["enrolled_business_portfolios"]) == 1
+    await env.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    for v, s in statuses_of(await env.values()):
+        assert ".ENT." in s["recipient_parent_user_id"]
+        assert v["contacts"][0]["parent_user_id"] == s["recipient_parent_user_id"]
+    parent = statuses_of(await env.values())[-1][1]["recipient_parent_user_id"]
+    r = await env.send({"recipient": parent, "type": "text", "text": {"body": "x"}})
+    assert r["contacts"][0]["user_id"] == parent
+    # disabled → empty account + 131009 on parent sends
+    env2 = await make_env(client)
+    acct = await env2.call("GET", "/parent-bsuid-accounts")
+    assert acct == {"parent_bsuid_account_id": None, "enrolled_business_portfolios": []}
+    r = await env2.send({"recipient": "BR.ENT.123456789012345", "type": "text",
+                         "text": {"body": "x"}}, expect=400)
+    assert r["error"]["code"] == 131009
+
+
+async def test_key_hygiene(client, monkeypatch):
+    from app import settings as s
+    from app.db import SessionLocal
+    from app.models import ApiKey
+    from app.rules import now
+
+    env = await make_env(client)
+    async with SessionLocal() as session:
+        await session.execute(update(ApiKey).values(
+            expires_at=now() - timedelta(days=1)))
+        await session.commit()
+    r = await client.post("/messages", headers=env.hk,
+                          json={"to": "1", "type": "text", "text": {"body": "x"}})
+    assert r.status_code == 401
+    assert "expired" in r.json()["error"]["error_data"]["details"]
+
+    monkeypatch.setattr(s, "KEYS_PER_IP_PER_HOUR", 2)
+    assert (await client.post("/sandbox/keys")).status_code == 200
+    assert (await client.post("/sandbox/keys")).status_code == 429
+
+
+async def test_config_validation(client):
+    env = await make_env(client)
+    for bad in ({"nope": 1},
+                {"user": {"phone_visibility": "sometimes"}},
+                {"user": {"in_contact_book": "yes"}},
+                {"statuses": {"sequence": ["sent", "exploded"]}},
+                {"inject_error": {"code": 1}}):
+        r = await env.config(bad, expect=400)
+        assert r["error"]["code"] == 100, bad
+    # partial updates merge
+    await env.config({"user": {"phone_visibility": "never"}})
+    cfg = await env.call("GET", "/sandbox/config")
+    assert cfg["user"]["phone_visibility"] == "never"
+    assert cfg["user"]["has_username"] is True  # untouched default
+    assert cfg["statuses"]["delays_ms"] == [0, 0, 0]  # earlier FAST patch kept
