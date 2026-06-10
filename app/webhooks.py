@@ -188,13 +188,10 @@ async def emit_status(session, message_id: str, status: str,
         value = {"messaging_product": "whatsapp", "metadata": metadata(key),
                  "statuses": [status_obj]}
     else:
-        # the matrix's "addressed by phone → phone always shown" applies under
-        # auto rules; a forced phone_visibility override wins (spec v2 §6.15)
-        vis_cfg = cfg["user"]["phone_visibility"]
-        if vis_cfg in ("always", "never"):
-            visible = vis_cfg == "always"
-        else:
-            visible = (msg.addressed_by == "phone") or rules.phone_visible(key, cfg)
+        # Meta's identifier quick reference: phone-addressed messages ALWAYS
+        # carry the phone in statuses (the business already knows it);
+        # phone_visibility — forced or auto — only gates BSUID-addressed ones
+        visible = (msg.addressed_by == "phone") or rules.phone_visible(key, cfg)
         if visible:
             status_obj["recipient_id"] = user.phone
         status_obj["recipient_user_id"] = user.bsuid

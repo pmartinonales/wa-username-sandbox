@@ -58,13 +58,19 @@ curl -s -X PUT $BASE/sandbox/config -H "D360-API-KEY: $KEY" -H 'Content-Type: ap
   "consumer_actions": {"reply_to_messages": true, "reply_delay_ms": 500}
 }'
 
-# 4. Call the real API
+# 4. Call the real API — send to any well-formed BSUID; it attaches to your simulated user
 curl -s -X POST $BASE/messages -H "D360-API-KEY: $KEY" -H 'Content-Type: application/json' \
-  -d '{"to":"5511988880001","type":"text","text":{"body":"Hi!"}}'
+  -d '{"recipient":"BR.13491208655302741918","type":"text","text":{"body":"Hi!"}}'
 ```
 
 ~0.5s later your endpoint receives BSUID-only status webhooks and a BSUID-only
 inbound reply — the exact payloads your production code must survive.
+
+> Note: had you sent **to a phone number** instead, the status webhooks would
+> include `recipient_id`/`wa_id` regardless of `phone_visibility` — per Meta's
+> identifier quick reference, phone-addressed messages always echo the phone
+> the business itself supplied. Visibility rules gate BSUID-addressed traffic
+> and inbound/contacts webhooks.
 
 ## How the simulation works
 

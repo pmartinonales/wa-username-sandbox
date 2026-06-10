@@ -83,12 +83,25 @@ async def test_auth_template_to_bsuid(client):
 async def test_foreign_bsuid(client):
     env_a = await make_env(client)
     env_b = await make_env(client)
-    r = await env_a.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
-    bsuid_a = r["contacts"][0]["user_id"]
+    # the sandbox-GENERATED bsuid of A's user (from a status webhook) is
+    # portfolio-scoped: using it with B's key is the cross-portfolio mistake
+    await env_a.send({"to": "5511911110001", "type": "text", "text": {"body": "x"}})
+    bsuid_a = statuses_of(await env_a.values())[-1][1]["recipient_user_id"]
     r = await env_b.send({"recipient": bsuid_a, "type": "text", "text": {"body": "x"}},
                          expect=400)
     assert r["error"]["code"] == 131009
     assert "portfolio" in r["error"]["error_data"]["details"]
+
+
+async def test_supplied_bsuid_shared_across_keys(client):
+    # tester-INVENTED values (e.g. the docs example BSUID) are adoptable by
+    # many keys — BSUIDs are portfolio-scoped, so this is not a conflict
+    env_a = await make_env(client)
+    env_b = await make_env(client)
+    r = await env_a.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    assert r["contacts"][0]["user_id"] == BSUID
+    r = await env_b.send({"recipient": BSUID, "type": "text", "text": {"body": "x"}})
+    assert r["contacts"][0]["user_id"] == BSUID
 
 
 async def test_malformed_bsuid(client):
@@ -363,12 +376,15 @@ async def test_five_minute_path(client):
             "consumer_actions": {"reply_to_messages": True, "reply_delay_ms": 0},
             "statuses": {"delays_ms": [0, 0, 0]}})
         assert r.status_code == 200
-        # 4. POST /messages — the only other endpoints used are real API
+        # 4. POST /messages — the only other endpoints used are real API.
+        # BSUID-addressed: phone-addressed statuses would always carry the
+        # phone per Meta's identifier quick reference.
         r = await client.post("/messages", headers=hk, json={
-            "to": "5511988880001", "type": "text", "text": {"body": "Hi!"}})
+            "recipient": "BR.13491208655302741918", "type": "text",
+            "text": {"body": "Hi!"}})
         assert r.status_code == 200, r.text
         wamid = r.json()["messages"][0]["id"]
-        assert r.json()["contacts"][0]["wa_id"] == "5511988880001"
+        assert r.json()["contacts"][0]["user_id"] == "BR.13491208655302741918"
 
         await drain()
         values = [p["entry"][0]["changes"][0]["value"] for p in received]

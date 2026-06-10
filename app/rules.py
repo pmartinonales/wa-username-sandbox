@@ -190,14 +190,15 @@ async def _retire_bsuids(session: AsyncSession, key: ApiKey) -> None:
         r.status = "retired"
 
 
-async def _register_bsuid(session: AsyncSession, key: ApiKey, value: str) -> None:
+async def _register_bsuid(session: AsyncSession, key: ApiKey, value: str,
+                          origin: str = "generated") -> None:
     existing = (await session.execute(select(Bsuid).where(
         Bsuid.api_key_id == key.id, Bsuid.value == value))).scalar_one_or_none()
     if existing:
         existing.status = "active"
     else:
         session.add(Bsuid(id=await ids.new_id(session, "bs"), api_key_id=key.id,
-                          value=value, status="active"))
+                          value=value, status="active", origin=origin))
 
 
 async def resolve_phone(session: AsyncSession, key: ApiKey, to: str) -> tuple[UserState, bool]:
@@ -235,20 +236,25 @@ async def resolve_bsuid(session: AsyncSession, key: ApiKey, cfg: dict,
     if not BSUID_RE.match(recipient):
         raise ApiError(131009, f"Malformed BSUID {recipient!r}. "
                                "Expected '<COUNTRY>.<18-20 digits>'.")
-    row = (await session.execute(select(Bsuid).where(
-        Bsuid.value == recipient))).scalars().first()
-    if row is not None:
-        if row.api_key_id != key.id:
-            raise ApiError(131009, "Recipient does not exist or does not belong to this "
-                                   "business portfolio.")
-        if row.status == "retired":
+    own = (await session.execute(select(Bsuid).where(
+        Bsuid.api_key_id == key.id, Bsuid.value == recipient))).scalars().first()
+    if own is not None:
+        if own.status == "retired":
             raise ApiError(131009, "Recipient does not exist or does not belong to this "
                                    "business portfolio (the user changed their phone "
                                    "number; this BSUID was regenerated).")
         user.bsuid = recipient
         return user
-    # unknown but well-formed → adopt as the user's current BSUID
-    await _register_bsuid(session, key, recipient)
+    # a value the sandbox GENERATED for another key is that portfolio's BSUID —
+    # using it here is the cross-portfolio mistake production rejects
+    foreign = (await session.execute(select(Bsuid).where(
+        Bsuid.value == recipient, Bsuid.origin == "generated"))).scalars().first()
+    if foreign is not None:
+        raise ApiError(131009, "Recipient does not exist or does not belong to this "
+                               "business portfolio.")
+    # unknown (or tester-supplied elsewhere) but well-formed → adopt; BSUIDs are
+    # portfolio-scoped, so the same supplied digits may live under many keys
+    await _register_bsuid(session, key, recipient, origin="supplied")
     user.bsuid = recipient
     return user
 

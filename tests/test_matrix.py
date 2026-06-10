@@ -37,28 +37,16 @@ async def test_inbound_matrix(client, user_cfg, expect):
 
 # statuses: (addressed_by, phone_visible) → recipient_id expectations
 async def test_status_matrix_phone_addressed(client):
-    # phone-addressed under auto rules: wa_id/recipient_id always, even when the
-    # real rules would hide the phone (GA + username + no history)
-    env = await make_env(client, config={"user": {"has_username": True,
-                                                  "phone_visibility": "auto",
-                                                  "in_contact_book": False}})
+    # Meta quick reference: phone-addressed → wa_id/recipient_id ALWAYS, even
+    # with phone_visibility forced to "never" (the business knows the phone —
+    # it just addressed it). The override gates BSUID-addressed traffic only.
+    env = await make_env(client, config={"user": {"phone_visibility": "never"}})
     await env.send({"to": "5511988880001", "type": "text", "text": {"body": "x"}})
     for v, s in statuses_of(await env.values()):
         assert s["recipient_id"] == "5511988880001"
         assert s["recipient_user_id"]
         assert v["contacts"][0]["wa_id"]
         assert v["contacts"][0]["user_id"]
-
-
-async def test_status_matrix_forced_never_wins_over_phone_addressed(client):
-    # a forced phone_visibility="never" strips the phone even on phone sends
-    # (this is what makes the five-minute path BSUID-only)
-    env = await make_env(client, config={"user": {"phone_visibility": "never"}})
-    await env.send({"to": "5511988880001", "type": "text", "text": {"body": "x"}})
-    for v, s in statuses_of(await env.values()):
-        assert "recipient_id" not in s
-        assert s["recipient_user_id"]
-        assert "wa_id" not in v["contacts"][0]
 
 
 async def test_status_matrix_bsuid_addressed_hidden(client):

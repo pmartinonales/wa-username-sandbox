@@ -59,13 +59,16 @@ class UserState(Base):
 
 class Bsuid(Base):
     """Every BSUID ever attached to a key's user. 'active' values resolve to the
-    user; 'retired' ones (pre-phone-change) return 131009. Global lookups catch
-    foreign BSUIDs (another key's user) → 131009."""
+    user; 'retired' ones (pre-phone-change) return 131009. origin='generated'
+    rows are key-scoped — using one with another key → 131009 (cross-portfolio);
+    origin='supplied' (tester-invented) values may be adopted by many keys,
+    since BSUIDs are portfolio-scoped and docs examples are shared."""
     __tablename__ = "bsuids"
     id: Mapped[str] = mapped_column(String, primary_key=True)
     api_key_id: Mapped[str] = mapped_column(ForeignKey("api_keys.id"), index=True)
     value: Mapped[str] = mapped_column(String, index=True)
     status: Mapped[str] = mapped_column(String, default="active")  # active | retired
+    origin: Mapped[str] = mapped_column(String, default="generated")  # generated | supplied
 
 
 class Template(Base):
