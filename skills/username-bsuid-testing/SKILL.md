@@ -32,14 +32,14 @@ Follow this loop for every request — whether it starts as "test my use case",
 1. **Clarify** the scenario until it's concrete (see interview checklist).
 2. **Configure** the sandbox to produce exactly that scenario.
 3. **Execute** the API calls — or have the user's own integration make them.
-4. **Observe** webhooks and the request log; compare against the rules.
-5. **Explain** what their integration must do to pass, with the exact fields
-   and error codes involved.
+4. **Observe** — immediately after executing, call `get_webhooks` and
+   `get_request_log` yourself. Never ask the user to check manually.
+5. **Explain** the results (see "Explaining results" below).
 
 Don't skip step 1: most confusion in this domain comes from under-specified
 scenarios ("user sends a message" — with a username? known phone? pre- or
-post-GA?). Don't skip step 4 either: claims like "the phone disappears" are
-verifiable in the delivery log — show, don't assert.
+post-GA?). Never skip step 4: always fetch the actual data and explain it —
+claims like "the phone disappears" are verifiable, so verify them.
 
 ### Interview checklist
 
@@ -185,17 +185,63 @@ Full domain rules (visibility, cache/book mechanics, username format rules,
 parent BSUIDs, GA semantics): [references/rules.md](references/rules.md).
 Exact payload shapes for every webhook type: [references/payloads.md](references/payloads.md).
 
-## Giving feedback on results
+## Explaining results
 
-When reporting results back, always:
+After every experiment, always produce a structured debrief — even if the
+user didn't ask. Pull the actual data first (`get_webhooks`, `get_request_log`),
+then explain in this order:
 
-- Quote the actual fields from the observed webhook/response (not paraphrased),
-  and point at what's present/absent versus the matrix.
-- State the rule that produced the behavior ("no `recipient_id` because the
-  send was BSUID-addressed, GA is on, the user has a username, and there's no
-  contact-book entry or fresh cache").
-- End with the pass criterion for their integration ("your handler must key
-  conversations on `from_user_id` and treat `from` as optional").
-- If something looks wrong versus the rules, say so plainly — the sandbox is
-  deterministic, so a mismatch means a misconfiguration (check `get_config`)
-  or a real finding.
+1. **What happened** — quote the key fields from the actual webhook/response
+   verbatim. Never paraphrase. Point at what's present and what's absent.
+2. **Why** — name the exact visibility rule that fired ("no `recipient_id`
+   because: BSUID-addressed, GA on, username adopted, no contact-book entry,
+   cache cold → BSUID-only").
+3. **What your service will receive** — describe the webhook payload shape
+   their handler will see in production: which fields are guaranteed, which
+   are conditional, and what breaks if you assume the optional ones are there.
+4. **Pass criterion** — one concrete sentence: "your handler must key
+   conversations on `from_user_id` and treat `from` as optional". This is
+   what "passing" this scenario means.
+5. **Flag anything unexpected** — if the observed behavior doesn't match the
+   rules, say so plainly. The sandbox is deterministic: a mismatch means a
+   misconfiguration (`get_config` to verify) or a real finding.
+
+## Guided readiness audit
+
+When the user asks anything like "help me make sure my service handles this
+correctly", "walk me through what I need to test", "is my integration ready
+for the username rollout", or similar broad readiness questions — run the
+full audit as a guided sequence, one scenario at a time.
+
+**Do not dump all recipes at once.** Instead:
+
+1. Briefly explain what you're about to do: "I'll walk you through 8
+   scenarios that cover the critical cases. We'll go one at a time — I'll
+   run each experiment, show you what the sandbox produced, and tell you
+   what your service needs to handle. Ready?"
+2. For each scenario in this sequence (drawn from the composite audit in
+   [references/recipes.md](references/recipes.md)):
+   - State the scenario name and what it tests (one sentence).
+   - Configure and execute it.
+   - Immediately fetch results and deliver the full debrief (steps 1–5 above).
+   - State **PASS** or **NEEDS ATTENTION** based on whether their service
+     would handle it correctly given what you observed.
+   - Ask: "Ready for the next one?" before continuing.
+3. After all scenarios, deliver a summary table:
+   | Scenario | Result | Action needed |
+   with one row per test. Flag any NEEDS ATTENTION items with the specific
+   code change required.
+
+**Audit sequence** (in order):
+1. BSUID-only inbound — state U+, CB- (run all three state variants: U+/CB-,
+   U-/CB-, U+/CB+)
+2. Reply to a BSUID
+3. Wamid correlation without a phone
+4. Closed window → 131047 → template fallback
+5. Auth template → 131062 → phone fallback
+6. Phone recovery via REQUEST_CONTACT_INFO
+7. Failed statuses (no `contacts` array)
+8. Pre-GA ↔ GA flip
+
+Start every audit on a fresh key so state is clean. Set zero delays in the
+first `update_config` so results are immediate.
