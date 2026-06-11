@@ -1,0 +1,23 @@
+{
+  "skill_name": "username-bsuid-testing",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "I run a customer support bot on WhatsApp through 360dialog. I heard phone numbers are going away because of the new username thing. Our sandbox runs at http://localhost:8000. Can you set up a test that shows me exactly what my webhooks will look like when a user who adopted a username messages me, and tell me what I need to change in my code? Also show me what changes if that same user is already in my contact book.",
+      "expected_output": "Creates a sandbox key, configures GA + username user, triggers a user-initiated inbound, shows the BSUID-only webhook (from_user_id/user_id/username present, from/wa_id absent), then flips in_contact_book and shows the phone reappearing; explains code must key on from_user_id and treat phone as optional.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "prompt": "my otp template keeps failing with error 131062 when we send login codes and I don't get why. we're testing against the username sandbox at http://localhost:8000. can you reproduce it and tell me the fix?",
+      "expected_output": "Explains 131062 = auth-flavored template addressed to a BSUID; reproduces it in the sandbox (auth template + BSUID recipient), shows the same template succeeding by phone, prescribes routing auth flows phone-only (or recovering the phone first).",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "We store all our WhatsApp customers by phone number. If a customer hides their number behind a username, is there any way to get it back? walk me through testing that whole flow end to end on our sandbox (http://localhost:8000)",
+      "expected_output": "Demonstrates the REQUEST_CONTACT_INFO recovery flow: BSUID-only state first, sends the interactive/template (button text exactly 'Share Contact Info'), simulated user taps, contacts webhook with origin=contact_request and no vCard, phone visible in subsequent webhooks; explains contact book/cache effects.",
+      "files": []
+    }
+  ]
+}
