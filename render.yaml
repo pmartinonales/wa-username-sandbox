@@ -1,0 +1,6 @@
+services:
+  - type: web
+    name: wa-username-sandbox
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
